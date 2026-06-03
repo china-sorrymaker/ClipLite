@@ -3,6 +3,7 @@
   --launcher-alpha: 0.88;
   --panel-rgb: 30, 32, 38;
   --panel-top-rgb: 48, 50, 58;
+  --panel-bg: rgba(var(--panel-rgb), var(--launcher-alpha));
   --text: #f4f6fb;
   --muted: #9ba2af;
   --accent: #8ecbff;
@@ -296,7 +297,7 @@ button {
   height: 100%;
   overflow: auto;
   padding: 24px;
-  background: rgba(var(--panel-rgb), 1);
+  background: var(--panel-bg);
   color: var(--text);
 }
 
