@@ -22,6 +22,8 @@ const DEFAULT_WIDTH: u32 = 620;
 const DEFAULT_HEIGHT: u32 = 460;
 const DEFAULT_TRANSPARENCY: u8 = 88;
 const DEFAULT_PASTE_DELAY_MS: u64 = 200;
+const DEFAULT_HISTORY_CLEANUP_MODE: &str = "count";
+const DEFAULT_HISTORY_RETENTION_DAYS: i64 = 30;
 const DEFAULT_HISTORY_RETENTION: i64 = HISTORY_LIMIT;
 const MIN_WIDTH: u32 = 420;
 const MAX_WIDTH: u32 = 900;
@@ -71,6 +73,8 @@ struct LauncherSettings {
     width: u32,
     height: u32,
     transparency: u8,
+    history_cleanup_mode: String,
+    history_retention_days: i64,
     history_retention: i64,
 }
 
@@ -93,6 +97,22 @@ struct ClipboardItem {
 #[derive(Debug, Serialize, Clone)]
 struct HistoryUpdatedPayload {
     item_id: Option<i64>,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct CleanHistoryResult {
+    cleaned_count: usize,
+    mode: String,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct DeleteItemResult {
+    id: i64,
+    existed_before: bool,
+    affected_rows: usize,
+    exists_after: bool,
 }
 
 #[tauri::command]
@@ -227,18 +247,55 @@ fn toggle_favorite(state: State<'_, AppState>, id: i64) -> Result<(), String> {
 }
 
 #[tauri::command]
-fn delete_item(state: State<'_, AppState>, id: i64) -> Result<(), String> {
+fn delete_item(app: AppHandle, state: State<'_, AppState>, id: i64) -> Result<DeleteItemResult, String> {
+    eprintln!("[delete_item] command entered");
+    eprintln!("[delete_item] record id={id}");
+
     let conn = state
         .db
         .lock()
         .map_err(|_| "Database lock failed".to_string())?;
-    conn.execute(
-        "UPDATE clipboard_items SET is_deleted = 1 WHERE id = ?1",
-        params![id],
-    )
+
+    let existed_before = clipboard_item_exists(&conn, id)?;
+    eprintln!("[delete_item] exists before delete={existed_before}");
+    eprintln!("[delete_item] SQL: DELETE FROM clipboard_items WHERE id = ?1");
+
+    let affected_rows = conn
+        .execute(
+            "DELETE FROM clipboard_items WHERE id = ?1",
+            params![id],
+        )
         .map_err(|error| error.to_string())?;
 
-    Ok(())
+    eprintln!("[delete_item] affected rows={affected_rows}");
+
+    let exists_after = clipboard_item_exists(&conn, id)?;
+    eprintln!("[delete_item] exists after delete={exists_after}");
+
+    app.emit(
+        "history-updated",
+        HistoryUpdatedPayload { item_id: None },
+    )
+    .map_err(|error| error.to_string())?;
+
+    Ok(DeleteItemResult {
+        id,
+        existed_before,
+        affected_rows,
+        exists_after,
+    })
+}
+
+fn clipboard_item_exists(conn: &Connection, id: i64) -> Result<bool, String> {
+    let count = conn
+        .query_row(
+            "SELECT COUNT(1) FROM clipboard_items WHERE id = ?1",
+            params![id],
+            |row| row.get::<_, i64>(0),
+        )
+        .map_err(|error| error.to_string())?;
+
+    Ok(count > 0)
 }
 
 #[tauri::command]
@@ -361,6 +418,33 @@ fn set_launcher_settings(
     Ok(settings)
 }
 
+#[tauri::command]
+fn clean_history_now(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    settings: LauncherSettings,
+) -> Result<CleanHistoryResult, String> {
+    let settings = sanitize_launcher_settings(settings);
+    let cleaned_count = {
+        let conn = state
+            .db
+            .lock()
+            .map_err(|_| "Database lock failed".to_string())?;
+        save_launcher_settings(&conn, &settings)?;
+        clean_history(&conn, &settings)?
+    };
+
+    app.emit("history-updated", HistoryUpdatedPayload { item_id: None })
+        .map_err(|error| error.to_string())?;
+    app.emit("settings-updated", settings.clone())
+        .map_err(|error| error.to_string())?;
+
+    Ok(CleanHistoryResult {
+        cleaned_count,
+        mode: settings.history_cleanup_mode,
+    })
+}
+
 pub fn run() {
     let active_shortcut = Arc::new(Mutex::new(Shortcut::new(
         Some(Modifiers::CONTROL | Modifiers::ALT),
@@ -441,7 +525,8 @@ pub fn run() {
             get_global_shortcut,
             set_global_shortcut,
             get_launcher_settings,
-            set_launcher_settings
+            set_launcher_settings,
+            clean_history_now
         ])
         .on_window_event(|window, event| {
             let label = window.label();
@@ -802,29 +887,113 @@ fn upsert_clipboard_text(db: &Db, text: &str) -> Result<i64, String> {
         conn.last_insert_rowid()
     };
 
-    let retention = get_setting(&conn, "history_retention")
-        .ok()
-        .flatten()
-        .and_then(|value| value.parse::<i64>().ok())
-        .filter(|value| matches!(value, 100 | 500 | 1000 | 5000 | 10000))
-        .unwrap_or(DEFAULT_HISTORY_RETENTION);
-
-    conn.execute(
-        "UPDATE clipboard_items
-         SET is_deleted = 1
-         WHERE is_favorite = 0
-           AND is_deleted = 0
-           AND id NOT IN (
-            SELECT id FROM clipboard_items
-            WHERE is_deleted = 0 AND is_favorite = 0
-            ORDER BY last_copied_at DESC
-            LIMIT ?1
-         )",
-        params![retention],
-    )
-    .map_err(|error| error.to_string())?;
+    let settings = load_launcher_settings(&conn)?;
+    let _ = clean_history(&conn, &settings)?;
 
     Ok(item_id)
+}
+
+fn clean_history(conn: &Connection, settings: &LauncherSettings) -> Result<usize, String> {
+    let mode = settings.history_cleanup_mode.as_str();
+    let total_before = count_clipboard_items(conn)?;
+
+    eprintln!("[clean_history] cleanup mode={mode}");
+    eprintln!(
+        "[clean_history] selected days={} count={}",
+        settings.history_retention_days, settings.history_retention
+    );
+    eprintln!("[clean_history] total records before={total_before}");
+
+    let eligible_count = count_cleanup_eligible_items(conn, settings)?;
+    eprintln!("[clean_history] eligible non-favorite records={eligible_count}");
+
+    let cleaned_count = match mode {
+        "time" => {
+            let cutoff = now_timestamp() - settings.history_retention_days * 24 * 60 * 60;
+            eprintln!(
+                "[clean_history] SQL: DELETE FROM clipboard_items WHERE is_favorite = 0 AND last_copied_at < ?1"
+            );
+            conn.execute(
+                "DELETE FROM clipboard_items
+                 WHERE is_favorite = 0
+                   AND last_copied_at < ?1",
+                params![cutoff],
+            )
+            .map_err(|error| error.to_string())?
+        }
+        "count" => {
+            eprintln!(
+                "[clean_history] SQL: DELETE FROM clipboard_items WHERE is_favorite = 0 AND id NOT IN (SELECT id FROM clipboard_items WHERE is_favorite = 0 ORDER BY last_copied_at DESC, id DESC LIMIT ?1)"
+            );
+            conn.execute(
+                "DELETE FROM clipboard_items
+                 WHERE is_favorite = 0
+                   AND id NOT IN (
+                    SELECT id FROM clipboard_items
+                    WHERE is_favorite = 0
+                    ORDER BY last_copied_at DESC, id DESC
+                    LIMIT ?1
+                 )",
+                params![settings.history_retention],
+            )
+            .map_err(|error| error.to_string())?
+        }
+        "never" => {
+            eprintln!("[clean_history] SQL: none; auto cleanup is disabled");
+            0
+        }
+        _ => {
+            eprintln!("[clean_history] SQL: none; unsupported cleanup mode");
+            0
+        }
+    };
+
+    let total_after = count_clipboard_items(conn)?;
+    eprintln!("[clean_history] affected rows={cleaned_count}");
+    eprintln!("[clean_history] total records after={total_after}");
+
+    Ok(cleaned_count)
+}
+
+fn count_clipboard_items(conn: &Connection) -> Result<i64, String> {
+    conn.query_row("SELECT COUNT(1) FROM clipboard_items", [], |row| {
+        row.get::<_, i64>(0)
+    })
+    .map_err(|error| error.to_string())
+}
+
+fn count_cleanup_eligible_items(conn: &Connection, settings: &LauncherSettings) -> Result<i64, String> {
+    match settings.history_cleanup_mode.as_str() {
+        "time" => {
+            let cutoff = now_timestamp() - settings.history_retention_days * 24 * 60 * 60;
+            conn.query_row(
+                "SELECT COUNT(1)
+                 FROM clipboard_items
+                 WHERE is_favorite = 0
+                   AND last_copied_at < ?1",
+                params![cutoff],
+                |row| row.get::<_, i64>(0),
+            )
+            .map_err(|error| error.to_string())
+        }
+        "count" => conn
+            .query_row(
+                "SELECT COUNT(1)
+                 FROM clipboard_items
+                 WHERE is_favorite = 0
+                   AND id NOT IN (
+                    SELECT id FROM clipboard_items
+                    WHERE is_favorite = 0
+                    ORDER BY last_copied_at DESC, id DESC
+                    LIMIT ?1
+                 )",
+                params![settings.history_retention],
+                |row| row.get::<_, i64>(0),
+            )
+            .map_err(|error| error.to_string()),
+        "never" => Ok(0),
+        _ => Ok(0),
+    }
 }
 
 fn items_query(tab: Option<&str>) -> &'static str {
@@ -1058,6 +1227,8 @@ fn default_launcher_settings() -> LauncherSettings {
         width: DEFAULT_WIDTH,
         height: DEFAULT_HEIGHT,
         transparency: DEFAULT_TRANSPARENCY,
+        history_cleanup_mode: DEFAULT_HISTORY_CLEANUP_MODE.to_string(),
+        history_retention_days: DEFAULT_HISTORY_RETENTION_DAYS,
         history_retention: DEFAULT_HISTORY_RETENTION,
     }
 }
@@ -1081,6 +1252,11 @@ fn load_launcher_settings(conn: &Connection) -> Result<LauncherSettings, String>
         transparency: get_setting(conn, "transparency")?
             .and_then(|value| value.parse::<u8>().ok())
             .unwrap_or(defaults.transparency),
+        history_cleanup_mode: get_setting(conn, "history_cleanup_mode")?
+            .unwrap_or(defaults.history_cleanup_mode),
+        history_retention_days: get_setting(conn, "history_retention_days")?
+            .and_then(|value| value.parse::<i64>().ok())
+            .unwrap_or(defaults.history_retention_days),
         history_retention: get_setting(conn, "history_retention")?
             .and_then(|value| value.parse::<i64>().ok())
             .unwrap_or(defaults.history_retention),
@@ -1096,6 +1272,12 @@ fn save_launcher_settings(conn: &Connection, settings: &LauncherSettings) -> Res
     set_setting(conn, "window_width", &settings.width.to_string())?;
     set_setting(conn, "window_height", &settings.height.to_string())?;
     set_setting(conn, "transparency", &settings.transparency.to_string())?;
+    set_setting(conn, "history_cleanup_mode", &settings.history_cleanup_mode)?;
+    set_setting(
+        conn,
+        "history_retention_days",
+        &settings.history_retention_days.to_string(),
+    )?;
     set_setting(conn, "history_retention", &settings.history_retention.to_string())?;
     Ok(())
 }
@@ -1128,6 +1310,14 @@ fn sanitize_launcher_settings(settings: LauncherSettings) -> LauncherSettings {
         transparency: match settings.transparency {
             70 | 80 | 88 | 90 | 100 => settings.transparency,
             _ => DEFAULT_TRANSPARENCY,
+        },
+        history_cleanup_mode: match settings.history_cleanup_mode.as_str() {
+            "time" | "count" | "never" => settings.history_cleanup_mode,
+            _ => DEFAULT_HISTORY_CLEANUP_MODE.to_string(),
+        },
+        history_retention_days: match settings.history_retention_days {
+            1 | 7 | 30 | 90 => settings.history_retention_days,
+            _ => DEFAULT_HISTORY_RETENTION_DAYS,
         },
         history_retention: match settings.history_retention {
             100 | 500 | 1000 | 5000 | 10000 => settings.history_retention,

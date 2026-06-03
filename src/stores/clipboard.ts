@@ -9,6 +9,18 @@ type HistoryUpdatedPayload = {
   item_id?: number;
 };
 
+type CleanHistoryResult = {
+  cleanedCount: number;
+  mode: 'time' | 'count' | 'never';
+};
+
+type DeleteItemResult = {
+  id: number;
+  existedBefore: boolean;
+  affectedRows: number;
+  existsAfter: boolean;
+};
+
 export const useClipboardStore = defineStore('clipboard', {
   state: () => ({
     items: [] as ClipboardItem[],
@@ -30,9 +42,12 @@ export const useClipboardStore = defineStore('clipboard', {
       width: 620,
       height: 460,
       transparency: 88,
+      historyCleanupMode: 'count',
+      historyRetentionDays: 30,
       historyRetention: 1000
     } as LauncherSettings,
     settingsLoading: false,
+    message: '',
     error: ''
   }),
   getters: {
@@ -61,7 +76,6 @@ export const useClipboardStore = defineStore('clipboard', {
     },
     async refresh() {
       this.loading = true;
-      this.error = '';
 
       try {
         const query = this.searchQuery.trim();
@@ -111,6 +125,7 @@ export const useClipboardStore = defineStore('clipboard', {
     },
     async copyItem(id: number, hideAfterCopy = false) {
       this.error = '';
+      this.message = '';
       try {
         await invoke(hideAfterCopy ? 'paste_item' : 'copy_item', { id });
         this.selectedId = id;
@@ -121,6 +136,7 @@ export const useClipboardStore = defineStore('clipboard', {
     },
     async toggleFavorite(id: number) {
       this.error = '';
+      this.message = '';
       try {
         await invoke('toggle_favorite', { id });
         await this.refresh();
@@ -130,11 +146,43 @@ export const useClipboardStore = defineStore('clipboard', {
     },
     async deleteItem(id: number) {
       this.error = '';
+      this.message = '';
       try {
-        await invoke('delete_item', { id });
+        const commandName = 'delete_item';
+        console.log('[delete_item] invoke command', commandName);
+        console.log('[delete_item] item id', id);
+        const response = await invoke<DeleteItemResult>(commandName, { id });
+        console.log('[delete_item] invoke response', response);
+        this.items = this.items.filter((item) => item.id !== id);
+        if (this.selectedId === id) {
+          this.selectedId = this.items[0]?.id ?? null;
+        }
         await this.refresh();
       } catch (error) {
         this.error = String(error);
+      }
+    },
+    async cleanHistoryNow() {
+      this.settingsLoading = true;
+      this.error = '';
+      this.message = '';
+
+      try {
+        const result = await invoke<CleanHistoryResult>('clean_history_now', {
+          settings: this.launcherSettings
+        });
+        await this.refresh();
+        if (result.mode === 'never') {
+          this.message = 'Auto cleanup is disabled';
+        } else if (result.cleanedCount > 0) {
+          this.message = `Cleaned ${result.cleanedCount} records`;
+        } else {
+          this.message = 'No records to clean';
+        }
+      } catch (error) {
+        this.error = String(error);
+      } finally {
+        this.settingsLoading = false;
       }
     },
     async hideWindow(reason = 'command') {
@@ -143,6 +191,7 @@ export const useClipboardStore = defineStore('clipboard', {
     async refreshAutoStart() {
       this.autoStartLoading = true;
       this.error = '';
+      this.message = '';
 
       try {
         this.autoStartEnabled = await invoke<boolean>('get_autostart_enabled');
@@ -155,6 +204,7 @@ export const useClipboardStore = defineStore('clipboard', {
     async setAutoStart(enabled: boolean) {
       this.autoStartLoading = true;
       this.error = '';
+      this.message = '';
 
       try {
         this.autoStartEnabled = await invoke<boolean>('set_autostart_enabled', { enabled });
@@ -167,6 +217,7 @@ export const useClipboardStore = defineStore('clipboard', {
     async refreshGlobalShortcut() {
       this.shortcutLoading = true;
       this.error = '';
+      this.message = '';
 
       try {
         this.globalShortcut = await invoke<string>('get_global_shortcut');
@@ -179,6 +230,7 @@ export const useClipboardStore = defineStore('clipboard', {
     async setGlobalShortcut(shortcut: string) {
       this.shortcutLoading = true;
       this.error = '';
+      this.message = '';
 
       try {
         this.globalShortcut = await invoke<string>('set_global_shortcut', { shortcut });
@@ -203,6 +255,7 @@ export const useClipboardStore = defineStore('clipboard', {
     async setLauncherSettings(settings: LauncherSettings) {
       this.settingsLoading = true;
       this.error = '';
+      this.message = '';
 
       try {
         this.launcherSettings = await invoke<LauncherSettings>('set_launcher_settings', { settings });

@@ -110,6 +110,8 @@ function toggleFavorite(event: MouseEvent, item: ClipboardItem) {
 
 function deleteItem(event: MouseEvent, item: ClipboardItem) {
   event.stopPropagation();
+  console.log('[delete_item] delete button clicked');
+  console.log('[delete_item] item id', item.id);
   void store.deleteItem(item.id);
 }
 
@@ -300,6 +302,10 @@ function updateSetting(partial: Partial<typeof store.launcherSettings>) {
   void store.setLauncherSettings({ ...store.launcherSettings, ...partial });
 }
 
+function cleanHistoryNow() {
+  void store.cleanHistoryNow();
+}
+
 function applyVisualSettings() {
   const setting = store.launcherSettings.theme;
   const resolved = setting === 'system'
@@ -359,12 +365,11 @@ function applyVisualSettings() {
     </nav>
 
     <section class="result-list" aria-live="polite">
-      <button
+      <div
         v-for="item in store.filteredItems"
         :key="item.id"
         class="result-item"
         :class="{ active: item.id === store.selectedId }"
-        type="button"
         @click="pasteItem(item)"
         @dblclick="pasteItem(item)"
       >
@@ -398,7 +403,7 @@ function applyVisualSettings() {
             <Trash2 :size="15" />
           </button>
         </span>
-      </button>
+      </div>
 
       <div v-if="!store.loading && store.filteredItems.length === 0" class="empty-state">
         <Clipboard :size="24" />
@@ -413,6 +418,7 @@ function applyVisualSettings() {
     </header>
 
     <div v-if="store.error" class="error" role="alert">{{ localizedError(store.error) }}</div>
+    <div v-if="store.message" class="status-message" role="status">{{ store.message }}</div>
 
     <section class="settings-group" :aria-label="t('settings.appearance')">
       <h2>{{ t('settings.appearance') }}</h2>
@@ -480,6 +486,31 @@ function applyVisualSettings() {
     <section class="settings-group" :aria-label="t('settings.history')">
       <h2>{{ t('settings.history') }}</h2>
       <label class="setting-row">
+        <span>{{ t('settings.historyCleanupMode') }}</span>
+        <select
+          :value="store.launcherSettings.historyCleanupMode"
+          :disabled="store.settingsLoading"
+          @change="updateSetting({ historyCleanupMode: ($event.target as HTMLSelectElement).value as any })"
+        >
+          <option value="time">{{ t('settings.cleanupByTime') }}</option>
+          <option value="count">{{ t('settings.cleanupByCount') }}</option>
+          <option value="never">{{ t('settings.cleanupNever') }}</option>
+        </select>
+      </label>
+      <label v-if="store.launcherSettings.historyCleanupMode === 'time'" class="setting-row">
+        <span>{{ t('settings.historyRetention') }}</span>
+        <select
+          :value="store.launcherSettings.historyRetentionDays"
+          :disabled="store.settingsLoading"
+          @change="updateSetting({ historyRetentionDays: Number(($event.target as HTMLSelectElement).value) as any })"
+        >
+          <option value="1">{{ t('settings.retentionDays', { count: 1 }) }}</option>
+          <option value="7">{{ t('settings.retentionDays', { count: 7 }) }}</option>
+          <option value="30">{{ t('settings.retentionDays', { count: 30 }) }}</option>
+          <option value="90">{{ t('settings.retentionDays', { count: 90 }) }}</option>
+        </select>
+      </label>
+      <label v-if="store.launcherSettings.historyCleanupMode === 'count'" class="setting-row">
         <span>{{ t('settings.historyRetention') }}</span>
         <select
           :value="store.launcherSettings.historyRetention"
@@ -492,6 +523,12 @@ function applyVisualSettings() {
           <option value="5000">{{ t('settings.retentionItems', { count: '5,000' }) }}</option>
           <option value="10000">{{ t('settings.retentionItems', { count: '10,000' }) }}</option>
         </select>
+      </label>
+      <label class="setting-row">
+        <span>{{ t('settings.historyFavoritesNote') }}</span>
+        <button class="setting-button" type="button" :disabled="store.settingsLoading" @click="cleanHistoryNow">
+          {{ t('settings.cleanNow') }}
+        </button>
       </label>
     </section>
 

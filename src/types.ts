@@ -17,6 +17,7 @@ export type ThemeMode = 'system' | 'dark' | 'light';
 export type LanguageMode = 'system' | 'zh-CN' | 'en-US';
 export type PopupPosition = 'mouse' | 'center';
 export type PasteStrategy = 'auto' | 'standard' | 'replace';
+export type HistoryCleanupMode = 'time' | 'count' | 'never';
 
 export interface LauncherSettings {
   language: LanguageMode;
@@ -27,5 +28,7 @@ export interface LauncherSettings {
   width: number;
   height: number;
   transparency: number;
+  historyCleanupMode: HistoryCleanupMode;
+  historyRetentionDays: 1 | 7 | 30 | 90;
   historyRetention: 100 | 500 | 1000 | 5000 | 10000;
 }

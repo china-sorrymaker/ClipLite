@@ -130,6 +130,15 @@ button {
   font-size: 12px;
 }
 
+.status-message {
+  margin: 10px 10px 0;
+  padding: 9px 11px;
+  border-radius: 8px;
+  background: rgba(120, 199, 255, 0.14);
+  color: var(--text);
+  font-size: 12px;
+}
+
 .tabs {
   display: grid;
   grid-template-columns: repeat(3, 1fr);
