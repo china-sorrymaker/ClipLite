@@ -10,7 +10,9 @@ export interface ClipboardItem {
   paste_count: number;
   last_copied_at: number;
   last_pasted_at: number | null;
-  content_type: 'plain' | 'url' | 'email' | 'json' | 'code';
+  content_type: 'plain' | 'url' | 'email' | 'json' | 'code' | 'file';
+  file_paths: string | null;
+  file_count: number | null;
 }
 
 export type ThemeMode = 'system' | 'dark' | 'light';

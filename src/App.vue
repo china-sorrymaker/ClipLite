@@ -6,6 +6,9 @@ import { getCurrentWindow } from '@tauri-apps/api/window';
 import {
   Clipboard,
   Copy,
+  File,
+  Files,
+  Folder,
   Hash,
   Keyboard,
   Link,
@@ -26,6 +29,13 @@ const isSettingsWindow = currentWindow.label === 'settings';
 const search = ref('');
 const searchInput = ref<HTMLInputElement | null>(null);
 const recordingShortcut = ref(false);
+const fileMissingByItem = ref<Record<number, boolean>>({});
+const fileFolderByItem = ref<Record<number, boolean>>({});
+
+type FilePathStatus = {
+  exists: boolean;
+  isDir: boolean;
+};
 
 let searchTimer: number | undefined;
 let systemThemeQuery: MediaQueryList | undefined;
@@ -38,12 +48,19 @@ watch(search, (value) => {
 });
 
 watch(() => store.launcherSettings, applyVisualSettings, { deep: true });
+watch(
+  () => store.items.map((item) => `${item.id}:${item.file_paths ?? ''}`).join('|'),
+  () => {
+    void refreshFileStatuses();
+  }
+);
 
 const t = (key: string, params?: Record<string, string | number>) =>
   createTranslator(store.launcherSettings.language)(key, params);
 
 onMounted(async () => {
   await store.initialize();
+  await refreshFileStatuses();
   applyVisualSettings();
   systemThemeQuery = window.matchMedia('(prefers-color-scheme: light)');
   systemThemeQuery.addEventListener('change', applyVisualSettings);
@@ -66,6 +83,74 @@ function focusSearch() {
 
 function preview(text: string) {
   return text.replace(/\s+/g, ' ').trim();
+}
+
+function filePaths(item: ClipboardItem) {
+  if (!item.file_paths) {
+    return [] as string[];
+  }
+
+  try {
+    return JSON.parse(item.file_paths) as string[];
+  } catch {
+    return [] as string[];
+  }
+}
+
+function baseName(path: string) {
+  return path.split(/[\\/]/).filter(Boolean).pop() ?? path;
+}
+
+function itemPreview(item: ClipboardItem) {
+  if (item.content_type === 'file') {
+    const paths = filePaths(item);
+    if (paths.length === 0) {
+      return 'File selection';
+    }
+    if (paths.length > 1) {
+      return `${paths.length} files`;
+    }
+
+    return baseName(paths[0]);
+  }
+
+  return preview(item.text);
+}
+
+function fileMeta(item: ClipboardItem) {
+  if (item.content_type !== 'file') {
+    return contentTypeLabel(item.content_type);
+  }
+
+  const paths = filePaths(item);
+  const missing = fileMissingByItem.value[item.id];
+  const prefix = paths.length > 1
+    ? 'Multiple files'
+    : fileFolderByItem.value[item.id]
+      ? 'Folder'
+      : 'File';
+
+  return missing ? `${prefix} / Missing` : prefix;
+}
+
+async function refreshFileStatuses() {
+  const nextMissing: Record<number, boolean> = {};
+  const nextFolder: Record<number, boolean> = {};
+  for (const item of store.items) {
+    if (item.content_type !== 'file' || !item.file_paths) {
+      continue;
+    }
+
+    try {
+      const statuses = await invoke<FilePathStatus[]>('file_paths_status', { pathsJson: item.file_paths });
+      nextMissing[item.id] = statuses.some((status) => !status.exists);
+      nextFolder[item.id] = statuses.length === 1 && statuses[0]?.isDir === true;
+    } catch {
+      nextMissing[item.id] = true;
+    }
+  }
+  fileMissingByItem.value = nextMissing;
+  fileFolderByItem.value = nextFolder;
 }
 
 function formatTime(timestamp: number) {
@@ -194,6 +279,22 @@ function openSettingsWindow() {
 
 function typeIcon(type: ClipboardItem['content_type']) {
   return type === 'url' ? Link : type === 'email' ? Mail : type === 'code' || type === 'json' ? Hash : Clipboard;
+}
+
+function itemIcon(item: ClipboardItem) {
+  if (item.content_type !== 'file') {
+    return typeIcon(item.content_type);
+  }
+
+  const paths = filePaths(item);
+  if (paths.length > 1) {
+    return Files;
+  }
+  if (fileFolderByItem.value[item.id]) {
+    return Folder;
+  }
+
+  return File;
 }
 
 function contentTypeLabel(type: ClipboardItem['content_type']) {
@@ -368,11 +469,11 @@ function applyVisualSettings() {
         @click="pasteItem(item)"
         @dblclick="pasteItem(item)"
       >
-        <component :is="typeIcon(item.content_type)" class="type-icon" :size="18" />
+        <component :is="itemIcon(item)" class="type-icon" :size="18" />
         <span class="result-main">
-          <span class="clip-text">{{ preview(item.text) }}</span>
+          <span class="clip-text">{{ itemPreview(item) }}</span>
           <span class="clip-meta">
-            {{ contentTypeLabel(item.content_type) }} / {{ formatTime(item.last_copied_at || item.updated_at) }}
+            {{ fileMeta(item) }} / {{ formatTime(item.last_copied_at || item.updated_at) }}
             <template v-if="item.paste_count > 0"> / {{ item.paste_count }} {{ t('launcher.pastes') }}</template>
           </span>
         </span>

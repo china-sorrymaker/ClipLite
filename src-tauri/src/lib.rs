@@ -3,6 +3,7 @@ use rusqlite::{params, Connection, OptionalExtension};
 use serde::{Deserialize, Serialize};
 use std::{
     fs,
+    path::Path,
     sync::{Arc, Mutex},
     thread,
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
@@ -88,11 +89,20 @@ struct ClipboardItem {
     last_copied_at: i64,
     last_pasted_at: Option<i64>,
     content_type: String,
+    file_paths: Option<String>,
+    file_count: Option<i64>,
 }
 
 #[derive(Debug, Serialize, Clone)]
 struct HistoryUpdatedPayload {
     item_id: Option<i64>,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct FilePathStatus {
+    exists: bool,
+    is_dir: bool,
 }
 
 #[tauri::command]
@@ -158,25 +168,38 @@ fn paste_item(app: AppHandle, state: State<'_, AppState>, id: i64) -> Result<(),
 }
 
 fn copy_item_to_clipboard(state: &State<'_, AppState>, id: i64, record_paste: bool) -> Result<(), String> {
-    let text = {
+    let item = {
         let conn = state
             .db
             .lock()
             .map_err(|_| "Database lock failed".to_string())?;
         conn.query_row(
-            "SELECT text FROM clipboard_items WHERE id = ?1 AND is_deleted = 0",
+            "SELECT text, content_type, file_paths FROM clipboard_items WHERE id = ?1 AND is_deleted = 0",
             params![id],
-            |row| row.get::<_, String>(0),
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, Option<String>>(2)?,
+                ))
+            },
         )
         .optional()
         .map_err(|error| error.to_string())?
         .ok_or_else(|| "Clipboard item not found".to_string())?
     };
 
-    Clipboard::new()
-        .map_err(|error| error.to_string())?
-        .set_text(text)
-        .map_err(|error| error.to_string())?;
+    let (text, content_type, file_paths) = item;
+    if content_type == "file" {
+        let file_paths = file_paths.ok_or_else(|| "File paths not found".to_string())?;
+        let paths: Vec<String> = serde_json::from_str(&file_paths).map_err(|error| error.to_string())?;
+        set_clipboard_file_drop(&paths)?;
+    } else {
+        Clipboard::new()
+            .map_err(|error| error.to_string())?
+            .set_text(text)
+            .map_err(|error| error.to_string())?;
+    }
 
     let conn = state
         .db
@@ -239,6 +262,21 @@ fn delete_item(state: State<'_, AppState>, id: i64) -> Result<(), String> {
         .map_err(|error| error.to_string())?;
 
     Ok(())
+}
+
+#[tauri::command]
+fn file_paths_status(paths_json: String) -> Result<Vec<FilePathStatus>, String> {
+    let paths: Vec<String> = serde_json::from_str(&paths_json).map_err(|error| error.to_string())?;
+    Ok(paths
+        .iter()
+        .map(|path| {
+            let path = Path::new(path);
+            FilePathStatus {
+                exists: path.exists(),
+                is_dir: path.is_dir(),
+            }
+        })
+        .collect())
 }
 
 #[tauri::command]
@@ -434,6 +472,7 @@ pub fn run() {
             paste_item,
             toggle_favorite,
             delete_item,
+            file_paths_status,
             get_autostart_enabled,
             set_autostart_enabled,
             hide_window,
@@ -487,7 +526,9 @@ fn initialize_database(db: &Db) -> Result<(), Box<dyn std::error::Error>> {
             paste_count INTEGER NOT NULL DEFAULT 0,
             last_copied_at INTEGER NOT NULL DEFAULT 0,
             last_pasted_at INTEGER DEFAULT NULL,
-            content_type TEXT NOT NULL DEFAULT 'plain'
+            content_type TEXT NOT NULL DEFAULT 'plain',
+            file_paths TEXT DEFAULT NULL,
+            file_count INTEGER DEFAULT NULL
         );
         CREATE INDEX IF NOT EXISTS idx_clipboard_items_updated_at
             ON clipboard_items(updated_at DESC);
@@ -543,6 +584,18 @@ fn initialize_database(db: &Db) -> Result<(), Box<dyn std::error::Error>> {
         &conn,
         "clipboard_items",
         "last_pasted_at",
+        "INTEGER DEFAULT NULL",
+    )?;
+    add_column_if_missing(
+        &conn,
+        "clipboard_items",
+        "file_paths",
+        "TEXT DEFAULT NULL",
+    )?;
+    add_column_if_missing(
+        &conn,
+        "clipboard_items",
+        "file_count",
         "INTEGER DEFAULT NULL",
     )?;
     ensure_nullable_clipboard_timestamps(&conn)?;
@@ -729,9 +782,32 @@ fn start_clipboard_monitor(app: AppHandle, db: Db) {
             }
         };
         let mut last_text = String::new();
+        let mut last_file_key = String::new();
 
         loop {
-            if let Ok(text) = clipboard.get_text() {
+            if clipboard_has_file_drop() {
+                match read_clipboard_file_paths() {
+                    Ok(paths) if !paths.is_empty() => {
+                        let file_key = file_paths_key(&paths);
+                        if file_key != last_file_key {
+                            last_file_key = file_key;
+                            match upsert_clipboard_files(&db, &paths) {
+                                Ok(item_id) => {
+                                    let _ = app.emit(
+                                        "history-updated",
+                                        HistoryUpdatedPayload {
+                                            item_id: Some(item_id),
+                                        },
+                                    );
+                                }
+                                Err(error) => eprintln!("Clipboard file save failed: {error}"),
+                            }
+                        }
+                    }
+                    Ok(_) => {}
+                    Err(error) => eprintln!("Clipboard file read failed: {error}"),
+                }
+            } else if let Ok(text) = clipboard.get_text() {
                 if should_store_text(&text, &last_text) {
                     last_text = text.clone();
 
@@ -756,6 +832,232 @@ fn start_clipboard_monitor(app: AppHandle, db: Db) {
 
 fn should_store_text(text: &str, last_text: &str) -> bool {
     !text.trim().is_empty() && text != last_text
+}
+
+#[cfg(target_os = "windows")]
+fn clipboard_has_file_drop() -> bool {
+    use windows::Win32::System::{DataExchange::IsClipboardFormatAvailable, Ole::CF_HDROP};
+
+    unsafe { IsClipboardFormatAvailable(CF_HDROP.0 as u32).is_ok() }
+}
+
+#[cfg(not(target_os = "windows"))]
+fn clipboard_has_file_drop() -> bool {
+    false
+}
+
+#[cfg(target_os = "windows")]
+fn read_clipboard_file_paths() -> Result<Vec<String>, String> {
+    use windows::Win32::{
+        Foundation::HANDLE,
+        System::{
+            DataExchange::{CloseClipboard, GetClipboardData, OpenClipboard},
+            Ole::CF_HDROP,
+        },
+        UI::Shell::{DragQueryFileW, HDROP},
+    };
+
+    struct ClipboardCloseGuard;
+    impl Drop for ClipboardCloseGuard {
+        fn drop(&mut self) {
+            let _ = unsafe { CloseClipboard() };
+        }
+    }
+
+    unsafe { OpenClipboard(None) }.map_err(|error| error.to_string())?;
+    let _guard = ClipboardCloseGuard;
+    let handle = unsafe { GetClipboardData(CF_HDROP.0 as u32) }.map_err(|error| error.to_string())?;
+    if handle == HANDLE::default() {
+        return Ok(Vec::new());
+    }
+
+    let hdrop = HDROP(handle.0);
+    let count = unsafe { DragQueryFileW(hdrop, u32::MAX, None) };
+    let mut paths = Vec::new();
+    for index in 0..count {
+        let len = unsafe { DragQueryFileW(hdrop, index, None) };
+        if len == 0 {
+            continue;
+        }
+        let mut buffer = vec![0u16; len as usize + 1];
+        let written = unsafe { DragQueryFileW(hdrop, index, Some(&mut buffer)) };
+        if written > 0 {
+            paths.push(String::from_utf16_lossy(&buffer[..written as usize]));
+        }
+    }
+
+    Ok(paths)
+}
+
+#[cfg(not(target_os = "windows"))]
+fn read_clipboard_file_paths() -> Result<Vec<String>, String> {
+    Ok(Vec::new())
+}
+
+fn file_paths_key(paths: &[String]) -> String {
+    paths.join("\n")
+}
+
+fn current_history_retention(conn: &Connection) -> Result<i64, String> {
+    Ok(get_setting(conn, "history_retention")?
+        .and_then(|value| value.parse::<i64>().ok())
+        .filter(|value| matches!(value, 100 | 500 | 1000 | 5000 | 10000))
+        .unwrap_or(DEFAULT_HISTORY_RETENTION))
+}
+
+fn upsert_clipboard_files(db: &Db, paths: &[String]) -> Result<i64, String> {
+    let conn = db.lock().map_err(|_| "Database lock failed".to_string())?;
+    let timestamp = now_timestamp();
+    let file_paths = serde_json::to_string(paths).map_err(|error| error.to_string())?;
+    let text_key = format!("file:{file_paths}");
+    let file_count = paths.len() as i64;
+
+    let existing_id = conn
+        .query_row(
+            "SELECT id FROM clipboard_items WHERE text = ?1",
+            params![text_key],
+            |row| row.get::<_, i64>(0),
+        )
+        .optional()
+        .map_err(|error| error.to_string())?;
+
+    let item_id = if let Some(id) = existing_id {
+        conn.execute(
+            "UPDATE clipboard_items
+             SET updated_at = ?1,
+                 last_copied_at = ?1,
+                 copy_count = copy_count + 1,
+                 content_type = 'file',
+                 file_paths = ?2,
+                 file_count = ?3,
+                 is_deleted = 0
+             WHERE id = ?4",
+            params![timestamp, file_paths, file_count, id],
+        )
+        .map_err(|error| error.to_string())?;
+        id
+    } else {
+        conn.execute(
+            "INSERT INTO clipboard_items (
+                text,
+                created_at,
+                updated_at,
+                copy_count,
+                last_copied_at,
+                content_type,
+                file_paths,
+                file_count
+             )
+             VALUES (?1, ?2, ?2, 1, ?2, 'file', ?3, ?4)",
+            params![text_key, timestamp, file_paths, file_count],
+        )
+        .map_err(|error| error.to_string())?;
+        conn.last_insert_rowid()
+    };
+
+    let retention = current_history_retention(&conn)?;
+    conn.execute(
+        "UPDATE clipboard_items
+         SET is_deleted = 1
+         WHERE is_favorite = 0
+           AND is_deleted = 0
+           AND id NOT IN (
+            SELECT id FROM clipboard_items
+            WHERE is_deleted = 0 AND is_favorite = 0
+            ORDER BY last_copied_at DESC
+            LIMIT ?1
+         )",
+        params![retention],
+    )
+    .map_err(|error| error.to_string())?;
+
+    Ok(item_id)
+}
+
+#[cfg(target_os = "windows")]
+fn set_clipboard_file_drop(paths: &[String]) -> Result<(), String> {
+    use windows::Win32::{
+        Foundation::{GlobalFree, HANDLE, HGLOBAL, POINT},
+        System::{
+            DataExchange::{CloseClipboard, EmptyClipboard, OpenClipboard, SetClipboardData},
+            Memory::{GlobalAlloc, GlobalLock, GlobalUnlock, GMEM_MOVEABLE},
+            Ole::CF_HDROP,
+        },
+        UI::Shell::DROPFILES,
+    };
+
+    if paths.is_empty() {
+        return Err("No file paths to restore".to_string());
+    }
+
+    struct ClipboardCloseGuard;
+    impl Drop for ClipboardCloseGuard {
+        fn drop(&mut self) {
+            let _ = unsafe { CloseClipboard() };
+        }
+    }
+
+    let mut wide_paths = Vec::<u16>::new();
+    for path in paths {
+        wide_paths.extend(path.encode_utf16());
+        wide_paths.push(0);
+    }
+    wide_paths.push(0);
+
+    let header_size = std::mem::size_of::<DROPFILES>();
+    let bytes_len = header_size + wide_paths.len() * std::mem::size_of::<u16>();
+    let memory = unsafe { GlobalAlloc(GMEM_MOVEABLE, bytes_len) }.map_err(|error| error.to_string())?;
+    let lock = unsafe { GlobalLock(memory) };
+    if lock.is_null() {
+        let _ = unsafe { GlobalFree(Some(memory)) };
+        return Err("GlobalLock failed for CF_HDROP".to_string());
+    }
+
+    let dropfiles = DROPFILES {
+        pFiles: header_size as u32,
+        pt: POINT { x: 0, y: 0 },
+        fNC: false.into(),
+        fWide: true.into(),
+    };
+
+    unsafe {
+        std::ptr::copy_nonoverlapping(
+            &dropfiles as *const DROPFILES as *const u8,
+            lock.cast::<u8>(),
+            header_size,
+        );
+        std::ptr::copy_nonoverlapping(
+            wide_paths.as_ptr(),
+            lock.cast::<u8>().add(header_size).cast::<u16>(),
+            wide_paths.len(),
+        );
+    }
+    let _ = unsafe { GlobalUnlock(memory) };
+
+    unsafe { OpenClipboard(None) }.map_err(|error| {
+        let _ = unsafe { GlobalFree(Some(memory)) };
+        error.to_string()
+    })?;
+    let _guard = ClipboardCloseGuard;
+
+    unsafe { EmptyClipboard() }.map_err(|error| {
+        let _ = unsafe { GlobalFree(Some(memory)) };
+        error.to_string()
+    })?;
+
+    let handle = HANDLE(memory.0);
+    match unsafe { SetClipboardData(CF_HDROP.0 as u32, Some(handle)) } {
+        Ok(_) => Ok(()),
+        Err(error) => {
+            let _ = unsafe { GlobalFree(Some(HGLOBAL(handle.0))) };
+            Err(error.to_string())
+        }
+    }
+}
+
+#[cfg(not(target_os = "windows"))]
+fn set_clipboard_file_drop(_: &[String]) -> Result<(), String> {
+    Err("File clipboard is only supported on Windows".to_string())
 }
 
 fn upsert_clipboard_text(db: &Db, text: &str) -> Result<i64, String> {
@@ -831,7 +1133,8 @@ fn items_query(tab: Option<&str>) -> &'static str {
     match tab.unwrap_or("recent") {
         "favorites" => {
             "SELECT id, text, created_at, updated_at, is_favorite, favorite_at, is_deleted,
-                    copy_count, paste_count, last_copied_at, last_pasted_at, content_type
+                    copy_count, paste_count, last_copied_at, last_pasted_at, content_type,
+                    file_paths, file_count
              FROM clipboard_items
              WHERE is_deleted = 0 AND is_favorite = 1
              ORDER BY favorite_at DESC, last_copied_at DESC
@@ -839,7 +1142,8 @@ fn items_query(tab: Option<&str>) -> &'static str {
         }
         "frequent" => {
             "SELECT id, text, created_at, updated_at, is_favorite, favorite_at, is_deleted,
-                    copy_count, paste_count, last_copied_at, last_pasted_at, content_type
+                    copy_count, paste_count, last_copied_at, last_pasted_at, content_type,
+                    file_paths, file_count
              FROM clipboard_items
              WHERE is_deleted = 0 AND paste_count > 0
              ORDER BY paste_count DESC, last_pasted_at DESC
@@ -847,7 +1151,8 @@ fn items_query(tab: Option<&str>) -> &'static str {
         }
         _ => {
             "SELECT id, text, created_at, updated_at, is_favorite, favorite_at, is_deleted,
-                    copy_count, paste_count, last_copied_at, last_pasted_at, content_type
+                    copy_count, paste_count, last_copied_at, last_pasted_at, content_type,
+                    file_paths, file_count
              FROM clipboard_items
              WHERE is_deleted = 0
              ORDER BY last_copied_at DESC
@@ -860,7 +1165,8 @@ fn search_query(tab: Option<&str>) -> &'static str {
     match tab.unwrap_or("recent") {
         "favorites" => {
             "SELECT id, text, created_at, updated_at, is_favorite, favorite_at, is_deleted,
-                    copy_count, paste_count, last_copied_at, last_pasted_at, content_type
+                    copy_count, paste_count, last_copied_at, last_pasted_at, content_type,
+                    file_paths, file_count
              FROM clipboard_items
              WHERE is_deleted = 0 AND is_favorite = 1 AND text LIKE ?1
              ORDER BY favorite_at DESC, last_copied_at DESC
@@ -868,7 +1174,8 @@ fn search_query(tab: Option<&str>) -> &'static str {
         }
         "frequent" => {
             "SELECT id, text, created_at, updated_at, is_favorite, favorite_at, is_deleted,
-                    copy_count, paste_count, last_copied_at, last_pasted_at, content_type
+                    copy_count, paste_count, last_copied_at, last_pasted_at, content_type,
+                    file_paths, file_count
              FROM clipboard_items
              WHERE is_deleted = 0 AND paste_count > 0 AND text LIKE ?1
              ORDER BY paste_count DESC, last_pasted_at DESC
@@ -876,7 +1183,8 @@ fn search_query(tab: Option<&str>) -> &'static str {
         }
         _ => {
             "SELECT id, text, created_at, updated_at, is_favorite, favorite_at, is_deleted,
-                    copy_count, paste_count, last_copied_at, last_pasted_at, content_type
+                    copy_count, paste_count, last_copied_at, last_pasted_at, content_type,
+                    file_paths, file_count
              FROM clipboard_items
              WHERE is_deleted = 0 AND text LIKE ?1
              ORDER BY last_copied_at DESC
@@ -905,6 +1213,8 @@ where
                 last_copied_at: row.get(9)?,
                 last_pasted_at: row.get(10)?,
                 content_type: row.get(11)?,
+                file_paths: row.get(12)?,
+                file_count: row.get(13)?,
             })
         })
         .map_err(|error| error.to_string())?;
@@ -965,7 +1275,9 @@ fn ensure_nullable_clipboard_timestamps(conn: &Connection) -> rusqlite::Result<(
             paste_count INTEGER NOT NULL DEFAULT 0,
             last_copied_at INTEGER NOT NULL DEFAULT 0,
             last_pasted_at INTEGER DEFAULT NULL,
-            content_type TEXT NOT NULL DEFAULT 'plain'
+            content_type TEXT NOT NULL DEFAULT 'plain',
+            file_paths TEXT DEFAULT NULL,
+            file_count INTEGER DEFAULT NULL
         );
         INSERT INTO clipboard_items_migrated (
             id,
@@ -980,7 +1292,9 @@ fn ensure_nullable_clipboard_timestamps(conn: &Connection) -> rusqlite::Result<(
             paste_count,
             last_copied_at,
             last_pasted_at,
-            content_type
+            content_type,
+            file_paths,
+            file_count
         )
         SELECT
             id,
@@ -995,7 +1309,9 @@ fn ensure_nullable_clipboard_timestamps(conn: &Connection) -> rusqlite::Result<(
             paste_count,
             last_copied_at,
             NULLIF(last_pasted_at, 0),
-            content_type
+            content_type,
+            file_paths,
+            file_count
         FROM clipboard_items;
         DROP TABLE clipboard_items;
         ALTER TABLE clipboard_items_migrated RENAME TO clipboard_items;
