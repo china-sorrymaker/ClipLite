@@ -255,6 +255,21 @@ button {
   color: var(--accent);
 }
 
+.image-thumb {
+  width: 32px;
+  height: 32px;
+  border-radius: 8px;
+  object-fit: cover;
+  background: var(--control-bg);
+}
+
+.image-thumb-loading {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  color: var(--muted);
+}
+
 .result-main {
   display: grid;
   min-width: 0;

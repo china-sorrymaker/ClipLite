@@ -3,6 +3,8 @@ import { invoke } from '@tauri-apps/api/core';
 import { listen } from '@tauri-apps/api/event';
 import type { ClipboardItem, LauncherSettings } from '../types';
 
+const DEBUG_CLIPBOARD_TIMING = false;
+
 export type HistoryTab = 'recent' | 'favorites' | 'frequent';
 
 type HistoryUpdatedPayload = {
@@ -75,6 +77,7 @@ export const useClipboardStore = defineStore('clipboard', {
       });
     },
     async refresh() {
+      const refreshStart = performance.now();
       this.loading = true;
 
       try {
@@ -94,6 +97,9 @@ export const useClipboardStore = defineStore('clipboard', {
         this.error = String(error);
       } finally {
         this.loading = false;
+        if (DEBUG_CLIPBOARD_TIMING) {
+          console.log('[clipboard] UI refresh time', `${(performance.now() - refreshStart).toFixed(1)}ms`);
+        }
       }
     },
     async setTab(tab: HistoryTab) {

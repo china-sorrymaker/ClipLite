@@ -66,7 +66,8 @@ export default {
     url: '链接',
     email: '邮箱',
     json: 'JSON',
-    code: '代码'
+    code: '代码',
+    image: '图片'
   },
   error: {
     shortcutModifier: '快捷键必须包含至少一个修饰键。',

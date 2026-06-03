@@ -66,7 +66,8 @@ export default {
     url: 'url',
     email: 'email',
     json: 'json',
-    code: 'code'
+    code: 'code',
+    image: 'image'
   },
   error: {
     shortcutModifier: 'Shortcut must include at least one modifier.',

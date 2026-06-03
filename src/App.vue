@@ -1,12 +1,13 @@
 <script setup lang="ts">
 import { nextTick, onMounted, ref, watch } from 'vue';
-import { invoke } from '@tauri-apps/api/core';
+import { convertFileSrc, invoke } from '@tauri-apps/api/core';
 import { listen } from '@tauri-apps/api/event';
 import { getCurrentWindow } from '@tauri-apps/api/window';
 import {
   Clipboard,
   Copy,
   Hash,
+  Image as ImageIcon,
   Keyboard,
   Link,
   Mail,
@@ -26,6 +27,7 @@ const isSettingsWindow = currentWindow.label === 'settings';
 const search = ref('');
 const searchInput = ref<HTMLInputElement | null>(null);
 const recordingShortcut = ref(false);
+const imageSources = ref<Record<number, string>>({});
 
 let searchTimer: number | undefined;
 let systemThemeQuery: MediaQueryList | undefined;
@@ -38,6 +40,12 @@ watch(search, (value) => {
 });
 
 watch(() => store.launcherSettings, applyVisualSettings, { deep: true });
+watch(
+  () => store.items.map((item) => `${item.id}:${item.thumbnail_path ?? ''}`).join('|'),
+  () => {
+    void verifyImageThumbnails();
+  }
+);
 
 const t = (key: string, params?: Record<string, string | number>) =>
   createTranslator(store.launcherSettings.language)(key, params);
@@ -66,6 +74,70 @@ function focusSearch() {
 
 function preview(text: string) {
   return text.replace(/\s+/g, ' ').trim();
+}
+
+function itemPreview(item: ClipboardItem) {
+  if (item.content_type === 'image') {
+    const size = imageDimensions(item);
+    if (isLongScreenshot(item)) {
+      return size ? `Long screenshot ${size}` : 'Long screenshot';
+    }
+    if (isLargeImage(item)) {
+      return size ? `Large image ${size}` : 'Large image';
+    }
+    return size ? `Image ${size}` : 'Image';
+  }
+
+  return preview(item.text);
+}
+
+function imageDimensions(item: ClipboardItem) {
+  return item.width && item.height ? `${item.width} x ${item.height}` : '';
+}
+
+function isLongScreenshot(item: ClipboardItem) {
+  return item.content_type === 'image' && !!item.height && item.height > 3000;
+}
+
+function isLargeImage(item: ClipboardItem) {
+  if (item.content_type !== 'image') {
+    return false;
+  }
+
+  const pixelCount = item.width && item.height ? item.width * item.height : 0;
+  return pixelCount > 4_000_000 || isLongScreenshot(item) || (!!item.file_size && item.file_size > 5 * 1024 * 1024);
+}
+
+function imageSrc(item: ClipboardItem) {
+  return imageSources.value[item.id] ?? '';
+}
+
+async function verifyImageThumbnails() {
+  const nextSources: Record<number, string> = {};
+
+  for (const item of store.items) {
+    if (item.content_type !== 'image' || !item.thumbnail_path) {
+      continue;
+    }
+
+    const convertedSrc = convertFileSrc(item.thumbnail_path);
+    const exists = await invoke<boolean>('image_file_exists', { path: item.thumbnail_path });
+    console.log('[image_thumbnail] thumbnail_path', item.thumbnail_path);
+    console.log('[image_thumbnail] converted image src', convertedSrc);
+    console.log('[image_thumbnail] file exists result', exists);
+
+    if (exists) {
+      nextSources[item.id] = convertedSrc;
+    }
+  }
+
+  imageSources.value = nextSources;
+}
+
+function onImageError(item: ClipboardItem) {
+  const remainingSources = { ...imageSources.value };
+  delete remainingSources[item.id];
+  imageSources.value = remainingSources;
 }
 
 function formatTime(timestamp: number) {
@@ -195,7 +267,15 @@ function openSettingsWindow() {
 }
 
 function typeIcon(type: ClipboardItem['content_type']) {
-  return type === 'url' ? Link : type === 'email' ? Mail : type === 'code' || type === 'json' ? Hash : Clipboard;
+  return type === 'image'
+    ? ImageIcon
+    : type === 'url'
+      ? Link
+      : type === 'email'
+        ? Mail
+        : type === 'code' || type === 'json'
+          ? Hash
+          : Clipboard;
 }
 
 function contentTypeLabel(type: ClipboardItem['content_type']) {
@@ -373,9 +453,19 @@ function applyVisualSettings() {
         @click="pasteItem(item)"
         @dblclick="pasteItem(item)"
       >
-        <component :is="typeIcon(item.content_type)" class="type-icon" :size="18" />
+        <img
+          v-if="item.content_type === 'image' && imageSrc(item)"
+          class="image-thumb"
+          :src="imageSrc(item)"
+          alt=""
+          @error="onImageError(item)"
+        />
+        <span v-else-if="item.content_type === 'image'" class="image-thumb image-thumb-loading">
+          <ImageIcon :size="16" />
+        </span>
+        <component v-else :is="typeIcon(item.content_type)" class="type-icon" :size="18" />
         <span class="result-main">
-          <span class="clip-text">{{ preview(item.text) }}</span>
+          <span class="clip-text">{{ itemPreview(item) }}</span>
           <span class="clip-meta">
             {{ contentTypeLabel(item.content_type) }} / {{ formatTime(item.last_copied_at || item.updated_at) }}
             <template v-if="item.paste_count > 0"> / {{ item.paste_count }} {{ t('launcher.pastes') }}</template>

@@ -3,6 +3,7 @@ use rusqlite::{params, Connection, OptionalExtension};
 use serde::{Deserialize, Serialize};
 use std::{
     fs,
+    path::{Path, PathBuf},
     sync::{Arc, Mutex},
     thread,
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
@@ -29,6 +30,14 @@ const MIN_WIDTH: u32 = 420;
 const MAX_WIDTH: u32 = 900;
 const MIN_HEIGHT: u32 = 320;
 const MAX_HEIGHT: u32 = 720;
+const IMAGE_THUMBNAIL_MAX_WIDTH: u32 = 240;
+const LARGE_IMAGE_THUMBNAIL_MAX_WIDTH: u32 = 220;
+const LARGE_IMAGE_THUMBNAIL_MAX_HEIGHT: u32 = 160;
+const LARGE_IMAGE_PIXEL_THRESHOLD: usize = 4_000_000;
+const LARGE_IMAGE_HEIGHT_THRESHOLD: usize = 3000;
+const LARGE_IMAGE_FILE_SIZE_THRESHOLD: i64 = 5 * 1024 * 1024;
+const IMAGE_CLIPBOARD_DEBUG: bool = false;
+const IMAGE_CLIPBOARD_THROTTLE_MS: u64 = 1000;
 
 type Db = Arc<Mutex<Connection>>;
 type ActiveShortcut = Arc<Mutex<Shortcut>>;
@@ -92,6 +101,25 @@ struct ClipboardItem {
     last_copied_at: i64,
     last_pasted_at: Option<i64>,
     content_type: String,
+    image_path: Option<String>,
+    thumbnail_path: Option<String>,
+    image_hash: Option<String>,
+    width: Option<i64>,
+    height: Option<i64>,
+    file_size: Option<i64>,
+}
+
+#[derive(Clone)]
+struct CapturedImage {
+    width: usize,
+    height: usize,
+    bytes: Vec<u8>,
+}
+
+#[derive(Clone)]
+struct ImageFileCandidate {
+    label: &'static str,
+    path: String,
 }
 
 #[derive(Debug, Serialize, Clone)]
@@ -178,25 +206,37 @@ fn paste_item(app: AppHandle, state: State<'_, AppState>, id: i64) -> Result<(),
 }
 
 fn copy_item_to_clipboard(state: &State<'_, AppState>, id: i64, record_paste: bool) -> Result<(), String> {
-    let text = {
+    let item = {
         let conn = state
             .db
             .lock()
             .map_err(|_| "Database lock failed".to_string())?;
         conn.query_row(
-            "SELECT text FROM clipboard_items WHERE id = ?1 AND is_deleted = 0",
+            "SELECT text, content_type, image_path FROM clipboard_items WHERE id = ?1 AND is_deleted = 0",
             params![id],
-            |row| row.get::<_, String>(0),
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, Option<String>>(2)?,
+                ))
+            },
         )
         .optional()
         .map_err(|error| error.to_string())?
         .ok_or_else(|| "Clipboard item not found".to_string())?
     };
 
-    Clipboard::new()
-        .map_err(|error| error.to_string())?
-        .set_text(text)
-        .map_err(|error| error.to_string())?;
+    let (text, content_type, image_path) = item;
+    let mut clipboard = Clipboard::new().map_err(|error| error.to_string())?;
+    if content_type == "image" {
+        let image_path = image_path.ok_or_else(|| "Image file path not found".to_string())?;
+        set_clipboard_image_from_file(&mut clipboard, Path::new(&image_path))?;
+    } else {
+        clipboard
+            .set_text(text)
+            .map_err(|error| error.to_string())?;
+    }
 
     let conn = state
         .db
@@ -259,6 +299,7 @@ fn delete_item(app: AppHandle, state: State<'_, AppState>, id: i64) -> Result<De
     let existed_before = clipboard_item_exists(&conn, id)?;
     eprintln!("[delete_item] exists before delete={existed_before}");
     eprintln!("[delete_item] SQL: DELETE FROM clipboard_items WHERE id = ?1");
+    let image_files_to_remove = image_files_for_record_delete(&conn, id)?;
 
     let affected_rows = conn
         .execute(
@@ -271,6 +312,7 @@ fn delete_item(app: AppHandle, state: State<'_, AppState>, id: i64) -> Result<De
 
     let exists_after = clipboard_item_exists(&conn, id)?;
     eprintln!("[delete_item] exists after delete={exists_after}");
+    remove_unreferenced_image_files(&conn, &image_files_to_remove)?;
 
     app.emit(
         "history-updated",
@@ -445,6 +487,14 @@ fn clean_history_now(
     })
 }
 
+#[tauri::command]
+fn image_file_exists(path: String) -> bool {
+    let exists = Path::new(&path).is_file();
+    eprintln!("[image_thumbnail] thumbnail_path={path}");
+    eprintln!("[image_thumbnail] file exists result={exists}");
+    exists
+}
+
 pub fn run() {
     let active_shortcut = Arc::new(Mutex::new(Shortcut::new(
         Some(Modifiers::CONTROL | Modifiers::ALT),
@@ -477,6 +527,8 @@ pub fn run() {
         .setup(move |app| {
             let db = open_database(app)?;
             initialize_database(&db)?;
+            let image_dir = app.path().app_data_dir()?.join("images");
+            fs::create_dir_all(&image_dir)?;
 
             let shortcut = load_shortcut(&db).unwrap_or_else(|error| {
                 eprintln!("Shortcut setting failed to load: {error}");
@@ -507,7 +559,7 @@ pub fn run() {
             apply_launcher_window_size(app.handle(), &launcher_settings)?;
             setup_tray(app)?;
             app.global_shortcut().register(shortcut)?;
-            start_clipboard_monitor(app.handle().clone(), db);
+            start_clipboard_monitor(app.handle().clone(), db, image_dir);
 
             Ok(())
         })
@@ -526,7 +578,8 @@ pub fn run() {
             set_global_shortcut,
             get_launcher_settings,
             set_launcher_settings,
-            clean_history_now
+            clean_history_now,
+            image_file_exists
         ])
         .on_window_event(|window, event| {
             let label = window.label();
@@ -572,7 +625,13 @@ fn initialize_database(db: &Db) -> Result<(), Box<dyn std::error::Error>> {
             paste_count INTEGER NOT NULL DEFAULT 0,
             last_copied_at INTEGER NOT NULL DEFAULT 0,
             last_pasted_at INTEGER DEFAULT NULL,
-            content_type TEXT NOT NULL DEFAULT 'plain'
+            content_type TEXT NOT NULL DEFAULT 'plain',
+            image_path TEXT DEFAULT NULL,
+            thumbnail_path TEXT DEFAULT NULL,
+            image_hash TEXT DEFAULT NULL,
+            width INTEGER DEFAULT NULL,
+            height INTEGER DEFAULT NULL,
+            file_size INTEGER DEFAULT NULL
         );
         CREATE INDEX IF NOT EXISTS idx_clipboard_items_updated_at
             ON clipboard_items(updated_at DESC);
@@ -630,6 +689,42 @@ fn initialize_database(db: &Db) -> Result<(), Box<dyn std::error::Error>> {
         "last_pasted_at",
         "INTEGER DEFAULT NULL",
     )?;
+    add_column_if_missing(
+        &conn,
+        "clipboard_items",
+        "image_path",
+        "TEXT DEFAULT NULL",
+    )?;
+    add_column_if_missing(
+        &conn,
+        "clipboard_items",
+        "thumbnail_path",
+        "TEXT DEFAULT NULL",
+    )?;
+    add_column_if_missing(
+        &conn,
+        "clipboard_items",
+        "image_hash",
+        "TEXT DEFAULT NULL",
+    )?;
+    add_column_if_missing(
+        &conn,
+        "clipboard_items",
+        "width",
+        "INTEGER DEFAULT NULL",
+    )?;
+    add_column_if_missing(
+        &conn,
+        "clipboard_items",
+        "height",
+        "INTEGER DEFAULT NULL",
+    )?;
+    add_column_if_missing(
+        &conn,
+        "clipboard_items",
+        "file_size",
+        "INTEGER DEFAULT NULL",
+    )?;
     ensure_nullable_clipboard_timestamps(&conn)?;
     conn.execute_batch(
         "
@@ -639,6 +734,8 @@ fn initialize_database(db: &Db) -> Result<(), Box<dyn std::error::Error>> {
             ON clipboard_items(favorite_at DESC);
         CREATE INDEX IF NOT EXISTS idx_clipboard_items_paste_count
             ON clipboard_items(paste_count DESC, last_pasted_at DESC);
+        CREATE INDEX IF NOT EXISTS idx_clipboard_items_image_hash
+            ON clipboard_items(image_hash);
         UPDATE clipboard_items
         SET last_copied_at = CASE WHEN last_copied_at = 0 THEN updated_at ELSE last_copied_at END,
             copy_count = CASE WHEN copy_count = 0 THEN 1 ELSE copy_count END,
@@ -804,7 +901,7 @@ fn create_tray_icon() -> Image<'static> {
     Image::new_owned(rgba, SIZE, SIZE)
 }
 
-fn start_clipboard_monitor(app: AppHandle, db: Db) {
+fn start_clipboard_monitor(app: AppHandle, db: Db, image_dir: PathBuf) {
     thread::spawn(move || {
         let mut clipboard = match Clipboard::new() {
             Ok(clipboard) => clipboard,
@@ -814,9 +911,67 @@ fn start_clipboard_monitor(app: AppHandle, db: Db) {
             }
         };
         let mut last_text = String::new();
+        let mut last_sequence_number = 0;
+        let mut last_processed_image_hash = String::new();
+        let mut last_image_process_at: Option<Instant> = None;
 
         loop {
-            if let Ok(text) = clipboard.get_text() {
+            let sequence_number = clipboard_sequence_number();
+            if sequence_number == last_sequence_number {
+                thread::sleep(Duration::from_millis(650));
+                continue;
+            }
+
+            if clipboard_has_image_format() {
+                if last_image_process_at
+                    .map(|processed_at| processed_at.elapsed() < Duration::from_millis(IMAGE_CLIPBOARD_THROTTLE_MS))
+                    .unwrap_or(false)
+                {
+                    thread::sleep(Duration::from_millis(100));
+                    continue;
+                }
+
+                let image_read_start = Instant::now();
+                match clipboard.get_image() {
+                    Ok(image) => {
+                        image_debug_log(format_args!("image read time {:?}", image_read_start.elapsed()));
+                        let captured = CapturedImage {
+                            width: image.width,
+                            height: image.height,
+                            bytes: image.bytes.as_ref().to_vec(),
+                        };
+                        let hash_start = Instant::now();
+                        let image_hash = stable_image_hash(&captured);
+                        image_debug_log(format_args!("hash time {:?}", hash_start.elapsed()));
+
+                        last_sequence_number = sequence_number;
+                        last_image_process_at = Some(Instant::now());
+
+                        if image_hash != last_processed_image_hash {
+                            last_processed_image_hash = image_hash.clone();
+                            let worker_app = app.clone();
+                            let worker_db = db.clone();
+                            let worker_image_dir = image_dir.clone();
+                            thread::spawn(move || {
+                                if let Err(error) = process_clipboard_image(
+                                    worker_app,
+                                    worker_db,
+                                    worker_image_dir,
+                                    captured,
+                                    image_hash,
+                                ) {
+                                    eprintln!("Clipboard image save failed: {error}");
+                                }
+                            });
+                        }
+                    }
+                    Err(error) => {
+                        last_sequence_number = sequence_number;
+                        eprintln!("Clipboard image read failed: {error}");
+                    }
+                }
+            } else if let Ok(text) = clipboard.get_text() {
+                last_sequence_number = sequence_number;
                 if should_store_text(&text, &last_text) {
                     last_text = text.clone();
 
@@ -832,6 +987,8 @@ fn start_clipboard_monitor(app: AppHandle, db: Db) {
                         Err(error) => eprintln!("Clipboard save failed: {error}"),
                     }
                 }
+            } else {
+                last_sequence_number = sequence_number;
             }
 
             thread::sleep(Duration::from_millis(650));
@@ -841,6 +998,398 @@ fn start_clipboard_monitor(app: AppHandle, db: Db) {
 
 fn should_store_text(text: &str, last_text: &str) -> bool {
     !text.trim().is_empty() && text != last_text
+}
+
+fn clipboard_sequence_number() -> u32 {
+    use windows::Win32::System::DataExchange::GetClipboardSequenceNumber;
+
+    unsafe { GetClipboardSequenceNumber() }
+}
+
+fn clipboard_has_image_format() -> bool {
+    use windows::Win32::System::{
+        DataExchange::IsClipboardFormatAvailable,
+        Ole::{CF_BITMAP, CF_DIB, CF_DIBV5},
+    };
+
+    unsafe {
+        IsClipboardFormatAvailable(CF_DIB.0 as u32).is_ok()
+            || IsClipboardFormatAvailable(CF_DIBV5.0 as u32).is_ok()
+            || IsClipboardFormatAvailable(CF_BITMAP.0 as u32).is_ok()
+    }
+}
+
+fn image_debug_log(args: std::fmt::Arguments<'_>) {
+    if IMAGE_CLIPBOARD_DEBUG {
+        eprintln!("[image_clipboard] {args}");
+    }
+}
+
+fn process_clipboard_image(
+    app: AppHandle,
+    db: Db,
+    image_dir: PathBuf,
+    image: CapturedImage,
+    image_hash: String,
+) -> Result<(), String> {
+    let total_start = Instant::now();
+    fs::create_dir_all(&image_dir).map_err(|error| error.to_string())?;
+    fs::create_dir_all(image_dir.join("thumbs")).map_err(|error| error.to_string())?;
+
+    let timestamp = now_timestamp();
+    let pixel_count = image_pixel_count(&image);
+    let large_by_dimensions = is_large_image_by_dimensions(&image);
+    if large_by_dimensions {
+        eprintln!(
+            "[large_image] image dimensions={}x{} pixel_count={}",
+            image.width, image.height, pixel_count
+        );
+    }
+
+    let db_start = Instant::now();
+    let (item_id, should_save_files) = insert_or_update_image_placeholder(&db, &image, &image_hash, timestamp)?;
+    image_debug_log(format_args!("database insert/update time {:?}", db_start.elapsed()));
+
+    let ui_refresh_start = Instant::now();
+    let _ = app.emit(
+        "history-updated",
+        HistoryUpdatedPayload {
+            item_id: Some(item_id),
+        },
+    );
+    image_debug_log(format_args!("UI refresh time {:?}", ui_refresh_start.elapsed()));
+
+    if !should_save_files {
+        return Ok(());
+    }
+
+    let image_path = image_dir.join(format!("{timestamp}-{image_hash}.png"));
+    let thumbnail_path = image_dir
+        .join("thumbs")
+        .join(format!("{timestamp}-{image_hash}.png"));
+
+    let save_start = Instant::now();
+    image::save_buffer_with_format(
+        &image_path,
+        &image.bytes,
+        image.width as u32,
+        image.height as u32,
+        image::ColorType::Rgba8,
+        image::ImageFormat::Png,
+    )
+    .map_err(|error| error.to_string())?;
+    let file_size = fs::metadata(&image_path)
+        .map_err(|error| error.to_string())?
+        .len() as i64;
+    let large_image = large_by_dimensions || file_size > LARGE_IMAGE_FILE_SIZE_THRESHOLD;
+    if large_image {
+        eprintln!(
+            "[large_image] image dimensions={}x{} pixel_count={} file_size={}",
+            image.width, image.height, pixel_count, file_size
+        );
+        eprintln!("[large_image] original save time {:?}", save_start.elapsed());
+    } else {
+        image_debug_log(format_args!("save original time {:?}", save_start.elapsed()));
+    }
+
+    let thumbnail_start = Instant::now();
+    save_thumbnail(&image, &thumbnail_path, large_image)?;
+    if large_image {
+        eprintln!("[large_image] thumbnail generation time {:?}", thumbnail_start.elapsed());
+    } else {
+        image_debug_log(format_args!("thumbnail time {:?}", thumbnail_start.elapsed()));
+    }
+
+    let db_update_start = Instant::now();
+    finalize_image_files(
+        &db,
+        item_id,
+        &image_path.to_string_lossy(),
+        &thumbnail_path.to_string_lossy(),
+        file_size,
+    )?;
+    image_debug_log(format_args!("database insert/update time {:?}", db_update_start.elapsed()));
+
+    let ui_refresh_start = Instant::now();
+    let _ = app.emit(
+        "history-updated",
+        HistoryUpdatedPayload {
+            item_id: Some(item_id),
+        },
+    );
+    image_debug_log(format_args!("UI refresh time {:?}", ui_refresh_start.elapsed()));
+    if large_image {
+        eprintln!("[large_image] total processing time {:?}", total_start.elapsed());
+    }
+
+    Ok(())
+}
+
+fn image_pixel_count(image: &CapturedImage) -> usize {
+    image.width.saturating_mul(image.height)
+}
+
+fn is_large_image_by_dimensions(image: &CapturedImage) -> bool {
+    image_pixel_count(image) > LARGE_IMAGE_PIXEL_THRESHOLD || image.height > LARGE_IMAGE_HEIGHT_THRESHOLD
+}
+
+fn stable_image_hash(image: &CapturedImage) -> String {
+    let mut hash = 0xcbf29ce484222325u64;
+    update_fnv_hash(&mut hash, &image.width.to_le_bytes());
+    update_fnv_hash(&mut hash, &image.height.to_le_bytes());
+    update_fnv_hash(&mut hash, &image.bytes);
+    format!("{hash:016x}")
+}
+
+fn update_fnv_hash(hash: &mut u64, bytes: &[u8]) {
+    for byte in bytes {
+        *hash ^= u64::from(*byte);
+        *hash = hash.wrapping_mul(0x100000001b3);
+    }
+}
+
+fn insert_or_update_image_placeholder(
+    db: &Db,
+    image: &CapturedImage,
+    image_hash: &str,
+    timestamp: i64,
+) -> Result<(i64, bool), String> {
+    let conn = db.lock().map_err(|_| "Database lock failed".to_string())?;
+    let existing = conn
+        .query_row(
+            "SELECT id, image_path FROM clipboard_items WHERE image_hash = ?1",
+            params![image_hash],
+            |row| Ok((row.get::<_, i64>(0)?, row.get::<_, Option<String>>(1)?)),
+        )
+        .optional()
+        .map_err(|error| error.to_string())?;
+
+    if let Some((id, image_path)) = existing {
+        conn.execute(
+            "UPDATE clipboard_items
+             SET updated_at = ?1,
+                 last_copied_at = ?1,
+                 copy_count = copy_count + 1,
+                 content_type = 'image',
+                 is_deleted = 0
+             WHERE id = ?2",
+            params![timestamp, id],
+        )
+        .map_err(|error| error.to_string())?;
+        return Ok((id, image_path.is_none()));
+    }
+
+    let text_key = format!("image:{image_hash}");
+    conn.execute(
+        "INSERT INTO clipboard_items (
+            text,
+            created_at,
+            updated_at,
+            copy_count,
+            last_copied_at,
+            content_type,
+            image_hash,
+            width,
+            height
+         )
+         VALUES (?1, ?2, ?2, 1, ?2, 'image', ?3, ?4, ?5)",
+        params![text_key, timestamp, image_hash, image.width as i64, image.height as i64],
+    )
+    .map_err(|error| error.to_string())?;
+    let item_id = conn.last_insert_rowid();
+
+    let settings = load_launcher_settings(&conn)?;
+    let _ = clean_history(&conn, &settings)?;
+
+    Ok((item_id, true))
+}
+
+fn finalize_image_files(
+    db: &Db,
+    item_id: i64,
+    image_path: &str,
+    thumbnail_path: &str,
+    file_size: i64,
+) -> Result<(), String> {
+    let conn = db.lock().map_err(|_| "Database lock failed".to_string())?;
+    conn.execute(
+        "UPDATE clipboard_items
+         SET image_path = ?1,
+             thumbnail_path = ?2,
+             file_size = ?3
+         WHERE id = ?4",
+        params![image_path, thumbnail_path, file_size, item_id],
+    )
+    .map_err(|error| error.to_string())?;
+    Ok(())
+}
+
+fn save_thumbnail(image: &CapturedImage, thumbnail_path: &Path, large_image: bool) -> Result<(), String> {
+    let source = image::RgbaImage::from_raw(image.width as u32, image.height as u32, image.bytes.clone())
+        .ok_or_else(|| "Invalid image buffer".to_string())?;
+
+    let thumbnail = if large_image {
+        let crop_height = if image.height > LARGE_IMAGE_HEIGHT_THRESHOLD {
+            let target_ratio = LARGE_IMAGE_THUMBNAIL_MAX_WIDTH as f64 / LARGE_IMAGE_THUMBNAIL_MAX_HEIGHT as f64;
+            ((image.width as f64 / target_ratio).round() as u32)
+                .max(1)
+                .min(image.height as u32)
+        } else {
+            image.height as u32
+        };
+        let source_view = image::imageops::crop_imm(&source, 0, 0, image.width as u32, crop_height);
+        let crop = source_view.to_image();
+        let (target_width, target_height) = fit_dimensions(
+            crop.width(),
+            crop.height(),
+            LARGE_IMAGE_THUMBNAIL_MAX_WIDTH,
+            LARGE_IMAGE_THUMBNAIL_MAX_HEIGHT,
+        );
+        image::imageops::resize(
+            &crop,
+            target_width,
+            target_height,
+            image::imageops::FilterType::Triangle,
+        )
+    } else {
+        let target_width = IMAGE_THUMBNAIL_MAX_WIDTH.min(image.width as u32);
+        let target_height = ((image.height as f64) * (target_width as f64 / image.width as f64))
+            .round()
+            .max(1.0) as u32;
+        image::imageops::resize(
+            &source,
+            target_width,
+            target_height,
+            image::imageops::FilterType::Triangle,
+        )
+    };
+
+    thumbnail.save(thumbnail_path).map_err(|error| error.to_string())
+}
+
+fn fit_dimensions(width: u32, height: u32, max_width: u32, max_height: u32) -> (u32, u32) {
+    let width_scale = max_width as f64 / width.max(1) as f64;
+    let height_scale = max_height as f64 / height.max(1) as f64;
+    let scale = width_scale.min(height_scale).min(1.0);
+    (
+        ((width as f64 * scale).round().max(1.0)) as u32,
+        ((height as f64 * scale).round().max(1.0)) as u32,
+    )
+}
+
+fn set_clipboard_image_from_file(_clipboard: &mut Clipboard, image_path: &Path) -> Result<(), String> {
+    let image = image::open(image_path).map_err(|error| error.to_string())?.to_rgba8();
+    let dib = rgba_to_clipboard_dib(image.width() as i32, image.height() as i32, image.as_raw())?;
+    set_clipboard_dib_with_retry(&dib)
+}
+
+fn rgba_to_clipboard_dib(width: i32, height: i32, rgba: &[u8]) -> Result<Vec<u8>, String> {
+    use windows::Win32::Graphics::Gdi::{BITMAPINFOHEADER, BI_RGB};
+
+    if width <= 0 || height <= 0 {
+        return Err("Invalid image dimensions".to_string());
+    }
+
+    let expected_len = width as usize * height as usize * 4;
+    if rgba.len() != expected_len {
+        return Err("Invalid RGBA image buffer size".to_string());
+    }
+
+    let header = BITMAPINFOHEADER {
+        biSize: std::mem::size_of::<BITMAPINFOHEADER>() as u32,
+        biWidth: width,
+        biHeight: -height,
+        biPlanes: 1,
+        biBitCount: 32,
+        biCompression: BI_RGB.0,
+        biSizeImage: expected_len as u32,
+        biXPelsPerMeter: 0,
+        biYPelsPerMeter: 0,
+        biClrUsed: 0,
+        biClrImportant: 0,
+    };
+
+    let mut dib = Vec::with_capacity(std::mem::size_of::<BITMAPINFOHEADER>() + expected_len);
+    let header_bytes = unsafe {
+        std::slice::from_raw_parts(
+            &header as *const BITMAPINFOHEADER as *const u8,
+            std::mem::size_of::<BITMAPINFOHEADER>(),
+        )
+    };
+    dib.extend_from_slice(header_bytes);
+
+    for pixel in rgba.chunks_exact(4) {
+        dib.extend_from_slice(&[pixel[2], pixel[1], pixel[0], pixel[3]]);
+    }
+
+    Ok(dib)
+}
+
+fn set_clipboard_dib_with_retry(dib: &[u8]) -> Result<(), String> {
+    use windows::Win32::{
+        Foundation::{GlobalFree, HANDLE, HGLOBAL},
+        System::{
+            DataExchange::{CloseClipboard, EmptyClipboard, OpenClipboard, SetClipboardData},
+            Memory::{GlobalAlloc, GlobalLock, GlobalUnlock, GMEM_MOVEABLE},
+            Ole::CF_DIB,
+        },
+    };
+
+    struct ClipboardCloseGuard;
+
+    impl Drop for ClipboardCloseGuard {
+        fn drop(&mut self) {
+            let result = unsafe { CloseClipboard() };
+            image_debug_log(format_args!("CloseClipboard result={result:?}"));
+        }
+    }
+
+    let mut open_result = None;
+    for attempt in 1..=5 {
+        let result = unsafe { OpenClipboard(None) };
+        image_debug_log(format_args!("OpenClipboard attempt={attempt} result={result:?}"));
+        if result.is_ok() {
+            open_result = Some(result);
+            break;
+        }
+        thread::sleep(Duration::from_millis(50));
+    }
+
+    if open_result.is_none() {
+        return Err("OpenClipboard failed after 5 attempts".to_string());
+    }
+
+    let _guard = ClipboardCloseGuard;
+    let empty_result = unsafe { EmptyClipboard() };
+    image_debug_log(format_args!("EmptyClipboard result={empty_result:?}"));
+    empty_result.map_err(|error| error.to_string())?;
+
+    let memory = unsafe { GlobalAlloc(GMEM_MOVEABLE, dib.len()) }.map_err(|error| error.to_string())?;
+    let lock = unsafe { GlobalLock(memory) };
+    if lock.is_null() {
+        let _ = unsafe { GlobalFree(Some(memory)) };
+        return Err("GlobalLock failed".to_string());
+    }
+
+    unsafe {
+        std::ptr::copy_nonoverlapping(dib.as_ptr(), lock.cast::<u8>(), dib.len());
+    }
+    let _ = unsafe { GlobalUnlock(memory) };
+
+    let handle = HANDLE(memory.0);
+    let set_result = unsafe { SetClipboardData(CF_DIB.0 as u32, Some(handle)) };
+    image_debug_log(format_args!("SetClipboardData result={set_result:?}"));
+
+    match set_result {
+        Ok(_) => Ok(()),
+        Err(error) => {
+            let free_result = unsafe { GlobalFree(Some(HGLOBAL(handle.0))) };
+            image_debug_log(format_args!(
+                "GlobalFree after SetClipboardData failure result={free_result:?}"
+            ));
+            Err(error.to_string())
+        }
+    }
 }
 
 fn upsert_clipboard_text(db: &Db, text: &str) -> Result<i64, String> {
@@ -906,6 +1455,7 @@ fn clean_history(conn: &Connection, settings: &LauncherSettings) -> Result<usize
 
     let eligible_count = count_cleanup_eligible_items(conn, settings)?;
     eprintln!("[clean_history] eligible non-favorite records={eligible_count}");
+    let image_files_to_remove = cleanup_image_files(conn, settings)?;
 
     let cleaned_count = match mode {
         "time" => {
@@ -949,6 +1499,7 @@ fn clean_history(conn: &Connection, settings: &LauncherSettings) -> Result<usize
     };
 
     let total_after = count_clipboard_items(conn)?;
+    remove_unreferenced_image_files(conn, &image_files_to_remove)?;
     eprintln!("[clean_history] affected rows={cleaned_count}");
     eprintln!("[clean_history] total records after={total_after}");
 
@@ -996,11 +1547,156 @@ fn count_cleanup_eligible_items(conn: &Connection, settings: &LauncherSettings) 
     }
 }
 
+fn image_files_for_record_delete(conn: &Connection, id: i64) -> Result<Vec<ImageFileCandidate>, String> {
+    let mut statement = conn
+        .prepare(
+            "SELECT image_path, thumbnail_path
+             FROM clipboard_items
+             WHERE id = ?1
+               AND content_type = 'image'",
+        )
+        .map_err(|error| error.to_string())?;
+    let rows = statement
+        .query_map(params![id], |row| {
+            Ok((
+                row.get::<_, Option<String>>(0)?,
+                row.get::<_, Option<String>>(1)?,
+            ))
+        })
+        .map_err(|error| error.to_string())?;
+
+    let mut candidates = Vec::new();
+    for row in rows {
+        let (image_path, thumbnail_path) = row.map_err(|error| error.to_string())?;
+        push_image_file_candidate(&mut candidates, "image_path", image_path);
+        push_image_file_candidate(&mut candidates, "thumbnail_path", thumbnail_path);
+    }
+
+    Ok(candidates)
+}
+
+fn cleanup_image_files(conn: &Connection, settings: &LauncherSettings) -> Result<Vec<ImageFileCandidate>, String> {
+    match settings.history_cleanup_mode.as_str() {
+        "time" => {
+            let cutoff = now_timestamp() - settings.history_retention_days * 24 * 60 * 60;
+            query_image_file_candidates(
+                conn,
+                "SELECT image_path, thumbnail_path
+                 FROM clipboard_items
+                 WHERE is_favorite = 0
+                   AND content_type = 'image'
+                   AND last_copied_at < ?1",
+                params![cutoff],
+            )
+        }
+        "count" => query_image_file_candidates(
+            conn,
+            "SELECT image_path, thumbnail_path
+             FROM clipboard_items
+             WHERE is_favorite = 0
+               AND content_type = 'image'
+               AND id NOT IN (
+                SELECT id FROM clipboard_items
+                WHERE is_favorite = 0
+                ORDER BY last_copied_at DESC, id DESC
+                LIMIT ?1
+             )",
+            params![settings.history_retention],
+        ),
+        "never" => Ok(Vec::new()),
+        _ => Ok(Vec::new()),
+    }
+}
+
+fn query_image_file_candidates<P>(
+    conn: &Connection,
+    sql: &str,
+    params: P,
+) -> Result<Vec<ImageFileCandidate>, String>
+where
+    P: rusqlite::Params,
+{
+    let mut statement = conn.prepare(sql).map_err(|error| error.to_string())?;
+    let rows = statement
+        .query_map(params, |row| {
+            Ok((
+                row.get::<_, Option<String>>(0)?,
+                row.get::<_, Option<String>>(1)?,
+            ))
+        })
+        .map_err(|error| error.to_string())?;
+
+    let mut candidates = Vec::new();
+    for row in rows {
+        let (image_path, thumbnail_path) = row.map_err(|error| error.to_string())?;
+        push_image_file_candidate(&mut candidates, "image_path", image_path);
+        push_image_file_candidate(&mut candidates, "thumbnail_path", thumbnail_path);
+    }
+
+    Ok(candidates)
+}
+
+fn push_image_file_candidate(
+    candidates: &mut Vec<ImageFileCandidate>,
+    label: &'static str,
+    path: Option<String>,
+) {
+    if let Some(path) = path {
+        if !path.trim().is_empty() {
+            candidates.push(ImageFileCandidate { label, path });
+        }
+    }
+}
+
+fn remove_unreferenced_image_files(
+    conn: &Connection,
+    candidates: &[ImageFileCandidate],
+) -> Result<(), String> {
+    for candidate in candidates {
+        if image_file_is_still_referenced(conn, &candidate.path)? {
+            continue;
+        }
+
+        match fs::remove_file(&candidate.path) {
+            Ok(()) => eprintln!(
+                "[image_cleanup] deleted {}={}",
+                candidate.label, candidate.path
+            ),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => eprintln!(
+                "[image_cleanup] file delete warning {}={} error={}",
+                candidate.label, candidate.path, error
+            ),
+            Err(error) => eprintln!(
+                "[image_cleanup] file delete error {}={} error={}",
+                candidate.label, candidate.path, error
+            ),
+        }
+    }
+
+    Ok(())
+}
+
+fn image_file_is_still_referenced(conn: &Connection, path: &str) -> Result<bool, String> {
+    let count = conn
+        .query_row(
+            "SELECT COUNT(1)
+             FROM clipboard_items
+             WHERE image_path = ?1
+                OR thumbnail_path = ?1",
+            params![path],
+            |row| row.get::<_, i64>(0),
+        )
+        .map_err(|error| error.to_string())?;
+
+    Ok(count > 0)
+}
+
 fn items_query(tab: Option<&str>) -> &'static str {
     match tab.unwrap_or("recent") {
         "favorites" => {
             "SELECT id, text, created_at, updated_at, is_favorite, favorite_at, is_deleted,
-                    copy_count, paste_count, last_copied_at, last_pasted_at, content_type
+                    copy_count, paste_count, last_copied_at, last_pasted_at, content_type,
+                    image_path, thumbnail_path, image_hash, width, height, file_size
              FROM clipboard_items
              WHERE is_deleted = 0 AND is_favorite = 1
              ORDER BY favorite_at DESC, last_copied_at DESC
@@ -1008,7 +1704,8 @@ fn items_query(tab: Option<&str>) -> &'static str {
         }
         "frequent" => {
             "SELECT id, text, created_at, updated_at, is_favorite, favorite_at, is_deleted,
-                    copy_count, paste_count, last_copied_at, last_pasted_at, content_type
+                    copy_count, paste_count, last_copied_at, last_pasted_at, content_type,
+                    image_path, thumbnail_path, image_hash, width, height, file_size
              FROM clipboard_items
              WHERE is_deleted = 0 AND paste_count > 0
              ORDER BY paste_count DESC, last_pasted_at DESC
@@ -1016,7 +1713,8 @@ fn items_query(tab: Option<&str>) -> &'static str {
         }
         _ => {
             "SELECT id, text, created_at, updated_at, is_favorite, favorite_at, is_deleted,
-                    copy_count, paste_count, last_copied_at, last_pasted_at, content_type
+                    copy_count, paste_count, last_copied_at, last_pasted_at, content_type,
+                    image_path, thumbnail_path, image_hash, width, height, file_size
              FROM clipboard_items
              WHERE is_deleted = 0
              ORDER BY last_copied_at DESC
@@ -1029,7 +1727,8 @@ fn search_query(tab: Option<&str>) -> &'static str {
     match tab.unwrap_or("recent") {
         "favorites" => {
             "SELECT id, text, created_at, updated_at, is_favorite, favorite_at, is_deleted,
-                    copy_count, paste_count, last_copied_at, last_pasted_at, content_type
+                    copy_count, paste_count, last_copied_at, last_pasted_at, content_type,
+                    image_path, thumbnail_path, image_hash, width, height, file_size
              FROM clipboard_items
              WHERE is_deleted = 0 AND is_favorite = 1 AND text LIKE ?1
              ORDER BY favorite_at DESC, last_copied_at DESC
@@ -1037,7 +1736,8 @@ fn search_query(tab: Option<&str>) -> &'static str {
         }
         "frequent" => {
             "SELECT id, text, created_at, updated_at, is_favorite, favorite_at, is_deleted,
-                    copy_count, paste_count, last_copied_at, last_pasted_at, content_type
+                    copy_count, paste_count, last_copied_at, last_pasted_at, content_type,
+                    image_path, thumbnail_path, image_hash, width, height, file_size
              FROM clipboard_items
              WHERE is_deleted = 0 AND paste_count > 0 AND text LIKE ?1
              ORDER BY paste_count DESC, last_pasted_at DESC
@@ -1045,7 +1745,8 @@ fn search_query(tab: Option<&str>) -> &'static str {
         }
         _ => {
             "SELECT id, text, created_at, updated_at, is_favorite, favorite_at, is_deleted,
-                    copy_count, paste_count, last_copied_at, last_pasted_at, content_type
+                    copy_count, paste_count, last_copied_at, last_pasted_at, content_type,
+                    image_path, thumbnail_path, image_hash, width, height, file_size
              FROM clipboard_items
              WHERE is_deleted = 0 AND text LIKE ?1
              ORDER BY last_copied_at DESC
@@ -1074,6 +1775,12 @@ where
                 last_copied_at: row.get(9)?,
                 last_pasted_at: row.get(10)?,
                 content_type: row.get(11)?,
+                image_path: row.get(12)?,
+                thumbnail_path: row.get(13)?,
+                image_hash: row.get(14)?,
+                width: row.get(15)?,
+                height: row.get(16)?,
+                file_size: row.get(17)?,
             })
         })
         .map_err(|error| error.to_string())?;
@@ -1134,7 +1841,13 @@ fn ensure_nullable_clipboard_timestamps(conn: &Connection) -> rusqlite::Result<(
             paste_count INTEGER NOT NULL DEFAULT 0,
             last_copied_at INTEGER NOT NULL DEFAULT 0,
             last_pasted_at INTEGER DEFAULT NULL,
-            content_type TEXT NOT NULL DEFAULT 'plain'
+            content_type TEXT NOT NULL DEFAULT 'plain',
+            image_path TEXT DEFAULT NULL,
+            thumbnail_path TEXT DEFAULT NULL,
+            image_hash TEXT DEFAULT NULL,
+            width INTEGER DEFAULT NULL,
+            height INTEGER DEFAULT NULL,
+            file_size INTEGER DEFAULT NULL
         );
         INSERT INTO clipboard_items_migrated (
             id,
@@ -1149,7 +1862,13 @@ fn ensure_nullable_clipboard_timestamps(conn: &Connection) -> rusqlite::Result<(
             paste_count,
             last_copied_at,
             last_pasted_at,
-            content_type
+            content_type,
+            image_path,
+            thumbnail_path,
+            image_hash,
+            width,
+            height,
+            file_size
         )
         SELECT
             id,
@@ -1164,7 +1883,13 @@ fn ensure_nullable_clipboard_timestamps(conn: &Connection) -> rusqlite::Result<(
             paste_count,
             last_copied_at,
             NULLIF(last_pasted_at, 0),
-            content_type
+            content_type,
+            image_path,
+            thumbnail_path,
+            image_hash,
+            width,
+            height,
+            file_size
         FROM clipboard_items;
         DROP TABLE clipboard_items;
         ALTER TABLE clipboard_items_migrated RENAME TO clipboard_items;
