@@ -22,6 +22,7 @@ const DEFAULT_WIDTH: u32 = 620;
 const DEFAULT_HEIGHT: u32 = 460;
 const DEFAULT_TRANSPARENCY: u8 = 88;
 const DEFAULT_PASTE_DELAY_MS: u64 = 200;
+const DEFAULT_HISTORY_RETENTION: i64 = HISTORY_LIMIT;
 const MIN_WIDTH: u32 = 420;
 const MAX_WIDTH: u32 = 900;
 const MIN_HEIGHT: u32 = 320;
@@ -30,12 +31,23 @@ const MAX_HEIGHT: u32 = 720;
 type Db = Arc<Mutex<Connection>>;
 type ActiveShortcut = Arc<Mutex<Shortcut>>;
 type PreviousInteraction = Arc<Mutex<InteractionSnapshot>>;
+type LauncherVisible = Arc<Mutex<bool>>;
+type TrayMenuItemsState = Arc<Mutex<Option<TrayMenuItems>>>;
 
 #[derive(Clone)]
 struct AppState {
     db: Db,
     shortcut: ActiveShortcut,
     previous_interaction: PreviousInteraction,
+    launcher_visible: LauncherVisible,
+    tray_menu_items: TrayMenuItemsState,
+}
+
+#[derive(Clone)]
+struct TrayMenuItems {
+    show: MenuItem<tauri::Wry>,
+    settings: MenuItem<tauri::Wry>,
+    quit: MenuItem<tauri::Wry>,
 }
 
 #[derive(Debug, Default, Clone)]
@@ -51,6 +63,7 @@ struct InteractionSnapshot {
 #[derive(Debug, Serialize, Deserialize, Clone)]
 #[serde(rename_all = "camelCase")]
 struct LauncherSettings {
+    language: String,
     theme: String,
     popup_position: String,
     paste_strategy: String,
@@ -58,6 +71,7 @@ struct LauncherSettings {
     width: u32,
     height: u32,
     transparency: u8,
+    history_retention: i64,
 }
 
 #[derive(Debug, Serialize)]
@@ -67,7 +81,12 @@ struct ClipboardItem {
     created_at: i64,
     updated_at: i64,
     is_favorite: bool,
-    usage_count: i64,
+    favorite_at: Option<i64>,
+    is_deleted: bool,
+    copy_count: i64,
+    paste_count: i64,
+    last_copied_at: i64,
+    last_pasted_at: Option<i64>,
     content_type: String,
 }
 
@@ -77,43 +96,34 @@ struct HistoryUpdatedPayload {
 }
 
 #[tauri::command]
-fn list_items(state: State<'_, AppState>) -> Result<Vec<ClipboardItem>, String> {
+fn list_items(state: State<'_, AppState>, tab: Option<String>) -> Result<Vec<ClipboardItem>, String> {
     let conn = state
         .db
         .lock()
         .map_err(|_| "Database lock failed".to_string())?;
-    query_items(
-        &conn,
-        "SELECT id, text, created_at, updated_at, is_favorite, usage_count, content_type
-         FROM clipboard_items
-         ORDER BY is_favorite DESC, usage_count DESC, updated_at DESC
-         LIMIT ?1",
-        params![HISTORY_LIMIT],
-    )
+    let sql = items_query(tab.as_deref());
+    query_items(&conn, sql, params![HISTORY_LIMIT])
 }
 
 #[tauri::command]
-fn search_items(state: State<'_, AppState>, query: String) -> Result<Vec<ClipboardItem>, String> {
+fn search_items(
+    state: State<'_, AppState>,
+    query: String,
+    tab: Option<String>,
+) -> Result<Vec<ClipboardItem>, String> {
     let conn = state
         .db
         .lock()
         .map_err(|_| "Database lock failed".to_string())?;
     let pattern = format!("%{}%", query);
 
-    query_items(
-        &conn,
-        "SELECT id, text, created_at, updated_at, is_favorite, usage_count, content_type
-         FROM clipboard_items
-         WHERE text LIKE ?1
-         ORDER BY is_favorite DESC, usage_count DESC, updated_at DESC
-         LIMIT ?2",
-        params![pattern, HISTORY_LIMIT],
-    )
+    let sql = search_query(tab.as_deref());
+    query_items(&conn, sql, params![pattern, HISTORY_LIMIT])
 }
 
 #[tauri::command]
 fn copy_item(state: State<'_, AppState>, id: i64) -> Result<(), String> {
-    copy_item_to_clipboard(&state, id)
+    copy_item_to_clipboard(&state, id, false)
 }
 
 #[tauri::command]
@@ -136,19 +146,10 @@ fn paste_item(app: AppHandle, state: State<'_, AppState>, id: i64) -> Result<(),
         load_launcher_settings(&conn)?
     };
 
-    copy_item_to_clipboard(&state, id)?;
+    copy_item_to_clipboard(&state, id, true)?;
     eprintln!("[paste_item] text copied to clipboard for item_id={id}");
 
-    let hide_start = Instant::now();
-    if let Some(window) = app.get_webview_window("main") {
-        window.hide().map_err(|error| error.to_string())?;
-        eprintln!("[paste_item] ClipLite hidden in {:?}", hide_start.elapsed());
-    } else {
-        eprintln!(
-            "[paste_item] main window not found while hiding after {:?}",
-            hide_start.elapsed()
-        );
-    }
+    hide_launcher(&app, "paste")?;
 
     paste_into_previous_window(snapshot, settings.paste_strategy, settings.paste_delay_ms)?;
     eprintln!("[paste_item] paste sequence completed for item_id={id}");
@@ -156,14 +157,14 @@ fn paste_item(app: AppHandle, state: State<'_, AppState>, id: i64) -> Result<(),
     Ok(())
 }
 
-fn copy_item_to_clipboard(state: &State<'_, AppState>, id: i64) -> Result<(), String> {
+fn copy_item_to_clipboard(state: &State<'_, AppState>, id: i64, record_paste: bool) -> Result<(), String> {
     let text = {
         let conn = state
             .db
             .lock()
             .map_err(|_| "Database lock failed".to_string())?;
         conn.query_row(
-            "SELECT text FROM clipboard_items WHERE id = ?1",
+            "SELECT text FROM clipboard_items WHERE id = ?1 AND is_deleted = 0",
             params![id],
             |row| row.get::<_, String>(0),
         )
@@ -181,13 +182,28 @@ fn copy_item_to_clipboard(state: &State<'_, AppState>, id: i64) -> Result<(), St
         .db
         .lock()
         .map_err(|_| "Database lock failed".to_string())?;
-    conn.execute(
-        "UPDATE clipboard_items
-         SET updated_at = ?1, usage_count = usage_count + 1
-         WHERE id = ?2",
-        params![now_timestamp(), id],
-    )
-    .map_err(|error| error.to_string())?;
+    let timestamp = now_timestamp();
+    if record_paste {
+        conn.execute(
+            "UPDATE clipboard_items
+             SET paste_count = paste_count + 1,
+                 last_pasted_at = ?1,
+                 updated_at = ?1
+             WHERE id = ?2",
+            params![timestamp, id],
+        )
+        .map_err(|error| error.to_string())?;
+    } else {
+        conn.execute(
+            "UPDATE clipboard_items
+             SET copy_count = copy_count + 1,
+                 last_copied_at = ?1,
+                 updated_at = ?1
+             WHERE id = ?2",
+            params![timestamp, id],
+        )
+        .map_err(|error| error.to_string())?;
+    }
 
     Ok(())
 }
@@ -200,9 +216,10 @@ fn toggle_favorite(state: State<'_, AppState>, id: i64) -> Result<(), String> {
         .map_err(|_| "Database lock failed".to_string())?;
     conn.execute(
         "UPDATE clipboard_items
-         SET is_favorite = CASE is_favorite WHEN 1 THEN 0 ELSE 1 END
-         WHERE id = ?1",
-        params![id],
+         SET is_favorite = CASE is_favorite WHEN 1 THEN 0 ELSE 1 END,
+             favorite_at = CASE is_favorite WHEN 1 THEN 0 ELSE ?1 END
+         WHERE id = ?2",
+        params![now_timestamp(), id],
     )
     .map_err(|error| error.to_string())?;
 
@@ -215,7 +232,10 @@ fn delete_item(state: State<'_, AppState>, id: i64) -> Result<(), String> {
         .db
         .lock()
         .map_err(|_| "Database lock failed".to_string())?;
-    conn.execute("DELETE FROM clipboard_items WHERE id = ?1", params![id])
+    conn.execute(
+        "UPDATE clipboard_items SET is_deleted = 1 WHERE id = ?1",
+        params![id],
+    )
         .map_err(|error| error.to_string())?;
 
     Ok(())
@@ -246,11 +266,19 @@ fn set_autostart_enabled(app: AppHandle, enabled: bool) -> Result<bool, String> 
 }
 
 #[tauri::command]
-fn hide_window(app: AppHandle) -> Result<(), String> {
-    if let Some(window) = app.get_webview_window("main") {
-        window.hide().map_err(|error| error.to_string())?;
-    }
+fn hide_window(app: AppHandle, reason: Option<String>) -> Result<(), String> {
+    hide_launcher(&app, reason.as_deref().unwrap_or("command"))
+}
 
+#[tauri::command]
+fn open_settings_window(app: AppHandle) -> Result<(), String> {
+    let Some(window) = app.get_webview_window("settings") else {
+        return Err("Settings window not found".to_string());
+    };
+
+    window.center().map_err(|error| error.to_string())?;
+    window.show().map_err(|error| error.to_string())?;
+    window.set_focus().map_err(|error| error.to_string())?;
     Ok(())
 }
 
@@ -327,6 +355,9 @@ fn set_launcher_settings(
     }
 
     apply_launcher_window_size(&app, &settings)?;
+    update_tray_language(&app, &settings);
+    app.emit("settings-updated", settings.clone())
+        .map_err(|error| error.to_string())?;
     Ok(settings)
 }
 
@@ -336,6 +367,8 @@ pub fn run() {
         Code::KeyV,
     )));
     let previous_interaction = Arc::new(Mutex::new(InteractionSnapshot::default()));
+    let launcher_visible = Arc::new(Mutex::new(false));
+    let tray_menu_items = Arc::new(Mutex::new(None));
     let handler_shortcut = active_shortcut.clone();
 
     tauri::Builder::default()
@@ -351,7 +384,8 @@ pub fn run() {
                     };
 
                     if shortcut == &*active_shortcut && event.state() == ShortcutState::Pressed {
-                        toggle_main_window(app);
+                        eprintln!("[launcher] shortcut pressed");
+                        toggle_launcher(app, "global shortcut");
                     }
                 })
                 .build(),
@@ -378,10 +412,14 @@ pub fn run() {
                 db: db.clone(),
                 shortcut: active_shortcut.clone(),
                 previous_interaction: previous_interaction.clone(),
+                launcher_visible: launcher_visible.clone(),
+                tray_menu_items: tray_menu_items.clone(),
             });
             if let Some(window) = app.get_webview_window("main") {
                 let _ = window.set_skip_taskbar(true);
             }
+            let _ = hide_launcher(app.handle(), "startup");
+            eprintln!("[launcher] startup visible state initialized false");
             apply_launcher_window_size(app.handle(), &launcher_settings)?;
             setup_tray(app)?;
             app.global_shortcut().register(shortcut)?;
@@ -399,15 +437,25 @@ pub fn run() {
             get_autostart_enabled,
             set_autostart_enabled,
             hide_window,
+            open_settings_window,
             get_global_shortcut,
             set_global_shortcut,
             get_launcher_settings,
             set_launcher_settings
         ])
         .on_window_event(|window, event| {
+            let label = window.label();
             if let WindowEvent::CloseRequested { api, .. } = event {
                 api.prevent_close();
-                let _ = window.hide();
+                if label == "main" {
+                    let _ = hide_launcher(window.app_handle(), "close");
+                } else if label == "settings" {
+                    let _ = window.hide();
+                }
+            } else if label == "main" {
+                if let WindowEvent::Focused(false) = event {
+                    let _ = hide_launcher(window.app_handle(), "blur");
+                }
             }
         })
         .run(tauri::generate_context!())
@@ -433,6 +481,12 @@ fn initialize_database(db: &Db) -> Result<(), Box<dyn std::error::Error>> {
             updated_at INTEGER NOT NULL,
             is_favorite INTEGER NOT NULL DEFAULT 0,
             usage_count INTEGER NOT NULL DEFAULT 0,
+            favorite_at INTEGER DEFAULT NULL,
+            is_deleted INTEGER NOT NULL DEFAULT 0,
+            copy_count INTEGER NOT NULL DEFAULT 0,
+            paste_count INTEGER NOT NULL DEFAULT 0,
+            last_copied_at INTEGER NOT NULL DEFAULT 0,
+            last_pasted_at INTEGER DEFAULT NULL,
             content_type TEXT NOT NULL DEFAULT 'plain'
         );
         CREATE INDEX IF NOT EXISTS idx_clipboard_items_updated_at
@@ -455,14 +509,92 @@ fn initialize_database(db: &Db) -> Result<(), Box<dyn std::error::Error>> {
         "content_type",
         "TEXT NOT NULL DEFAULT 'plain'",
     )?;
+    add_column_if_missing(
+        &conn,
+        "clipboard_items",
+        "favorite_at",
+        "INTEGER DEFAULT NULL",
+    )?;
+    add_column_if_missing(
+        &conn,
+        "clipboard_items",
+        "is_deleted",
+        "INTEGER NOT NULL DEFAULT 0",
+    )?;
+    add_column_if_missing(
+        &conn,
+        "clipboard_items",
+        "copy_count",
+        "INTEGER NOT NULL DEFAULT 0",
+    )?;
+    add_column_if_missing(
+        &conn,
+        "clipboard_items",
+        "paste_count",
+        "INTEGER NOT NULL DEFAULT 0",
+    )?;
+    add_column_if_missing(
+        &conn,
+        "clipboard_items",
+        "last_copied_at",
+        "INTEGER NOT NULL DEFAULT 0",
+    )?;
+    add_column_if_missing(
+        &conn,
+        "clipboard_items",
+        "last_pasted_at",
+        "INTEGER DEFAULT NULL",
+    )?;
+    ensure_nullable_clipboard_timestamps(&conn)?;
+    conn.execute_batch(
+        "
+        CREATE INDEX IF NOT EXISTS idx_clipboard_items_last_copied_at
+            ON clipboard_items(last_copied_at DESC);
+        CREATE INDEX IF NOT EXISTS idx_clipboard_items_favorite_at
+            ON clipboard_items(favorite_at DESC);
+        CREATE INDEX IF NOT EXISTS idx_clipboard_items_paste_count
+            ON clipboard_items(paste_count DESC, last_pasted_at DESC);
+        UPDATE clipboard_items
+        SET last_copied_at = CASE WHEN last_copied_at = 0 THEN updated_at ELSE last_copied_at END,
+            copy_count = CASE WHEN copy_count = 0 THEN 1 ELSE copy_count END,
+            paste_count = CASE WHEN paste_count = 0 THEN usage_count ELSE paste_count END,
+            last_pasted_at = CASE
+                WHEN (last_pasted_at IS NULL OR last_pasted_at = 0) AND usage_count > 0 THEN updated_at
+                WHEN last_pasted_at = 0 THEN NULL
+                ELSE last_pasted_at
+            END,
+            favorite_at = CASE
+                WHEN (favorite_at IS NULL OR favorite_at = 0) AND is_favorite = 1 THEN updated_at
+                WHEN favorite_at = 0 THEN NULL
+                ELSE favorite_at
+            END;
+        ",
+    )?;
 
     Ok(())
 }
 
 fn setup_tray(app: &mut App) -> tauri::Result<()> {
-    let show = MenuItem::with_id(app, "show", "Show ClipLite", true, None::<&str>)?;
-    let quit = MenuItem::with_id(app, "quit", "Quit", true, None::<&str>)?;
-    let menu = Menu::with_items(app, &[&show, &quit])?;
+    let settings = {
+        let state = app.state::<AppState>();
+        load_launcher_settings_from_state(&state)
+    };
+    let locale = resolve_rust_locale(&settings.language);
+    let show = MenuItem::with_id(app, "show", tray_text(locale, "show"), true, None::<&str>)?;
+    let settings_item = MenuItem::with_id(app, "settings", tray_text(locale, "settings"), true, None::<&str>)?;
+    let quit = MenuItem::with_id(app, "quit", tray_text(locale, "quit"), true, None::<&str>)?;
+    let menu = Menu::with_items(app, &[&show, &settings_item, &quit])?;
+
+    {
+        let state = app.state::<AppState>();
+        if let Ok(mut items) = state.tray_menu_items.lock() {
+            *items = Some(TrayMenuItems {
+                show: show.clone(),
+                settings: settings_item.clone(),
+                quit: quit.clone(),
+            });
+        };
+    }
 
     let builder = TrayIconBuilder::with_id("main")
         .icon(create_tray_icon())
@@ -471,6 +603,9 @@ fn setup_tray(app: &mut App) -> tauri::Result<()> {
         .show_menu_on_left_click(false)
         .on_menu_event(|app, event| match event.id.as_ref() {
             "show" => show_main_window(app),
+            "settings" => {
+                let _ = open_settings_window(app.clone());
+            }
             "quit" => app.exit(0),
             _ => {}
         })
@@ -481,13 +616,79 @@ fn setup_tray(app: &mut App) -> tauri::Result<()> {
                 ..
             } = event
             {
-                toggle_main_window(tray.app_handle());
+                toggle_launcher(tray.app_handle(), "tray");
             }
         });
 
     builder.build(app)?;
 
     Ok(())
+}
+
+#[derive(Clone, Copy)]
+enum RustLocale {
+    En,
+    Zh,
+}
+
+fn resolve_rust_locale(language: &str) -> RustLocale {
+    match language {
+        "zh-CN" => RustLocale::Zh,
+        "en-US" => RustLocale::En,
+        _ => system_rust_locale(),
+    }
+}
+
+#[cfg(target_os = "windows")]
+fn system_rust_locale() -> RustLocale {
+    use windows::Win32::Globalization::GetUserDefaultLocaleName;
+
+    let mut buffer = [0u16; 85];
+    let len = unsafe { GetUserDefaultLocaleName(&mut buffer) };
+    if len > 0 {
+        let locale = String::from_utf16_lossy(&buffer[..len.saturating_sub(1) as usize]);
+        if locale.to_ascii_lowercase().starts_with("zh") {
+            return RustLocale::Zh;
+        }
+    }
+
+    RustLocale::En
+}
+
+#[cfg(not(target_os = "windows"))]
+fn system_rust_locale() -> RustLocale {
+    std::env::var("LANG")
+        .ok()
+        .filter(|value| value.to_ascii_lowercase().starts_with("zh"))
+        .map(|_| RustLocale::Zh)
+        .unwrap_or(RustLocale::En)
+}
+
+fn tray_text(locale: RustLocale, key: &str) -> &'static str {
+    match (locale, key) {
+        (RustLocale::Zh, "show") => "显示 ClipLite",
+        (RustLocale::Zh, "settings") => "设置",
+        (RustLocale::Zh, "quit") => "退出",
+        (_, "show") => "Show ClipLite",
+        (_, "settings") => "Settings",
+        (_, "quit") => "Quit",
+        _ => "",
+    }
+}
+
+fn update_tray_language(app: &AppHandle, settings: &LauncherSettings) {
+    let locale = resolve_rust_locale(&settings.language);
+    let state = app.state::<AppState>();
+    let Ok(items) = state.tray_menu_items.lock() else {
+        return;
+    };
+    let Some(items) = items.as_ref() else {
+        return;
+    };
+
+    let _ = items.show.set_text(tray_text(locale, "show"));
+    let _ = items.settings.set_text(tray_text(locale, "settings"));
+    let _ = items.quit.set_text(tray_text(locale, "quit"));
 }
 
 fn create_tray_icon() -> Image<'static> {
@@ -574,7 +775,11 @@ fn upsert_clipboard_text(db: &Db, text: &str) -> Result<i64, String> {
     let item_id = if let Some(id) = existing_id {
         conn.execute(
             "UPDATE clipboard_items
-             SET updated_at = ?1, content_type = ?2
+             SET updated_at = ?1,
+                 last_copied_at = ?1,
+                 copy_count = copy_count + 1,
+                 content_type = ?2,
+                 is_deleted = 0
              WHERE id = ?3",
             params![timestamp, content_type, id],
         )
@@ -582,26 +787,102 @@ fn upsert_clipboard_text(db: &Db, text: &str) -> Result<i64, String> {
         id
     } else {
         conn.execute(
-            "INSERT INTO clipboard_items (text, created_at, updated_at, content_type)
-             VALUES (?1, ?2, ?2, ?3)",
+            "INSERT INTO clipboard_items (
+                text,
+                created_at,
+                updated_at,
+                copy_count,
+                last_copied_at,
+                content_type
+             )
+             VALUES (?1, ?2, ?2, 1, ?2, ?3)",
             params![text, timestamp, content_type],
         )
         .map_err(|error| error.to_string())?;
         conn.last_insert_rowid()
     };
 
+    let retention = get_setting(&conn, "history_retention")
+        .ok()
+        .flatten()
+        .and_then(|value| value.parse::<i64>().ok())
+        .filter(|value| matches!(value, 100 | 500 | 1000 | 5000 | 10000))
+        .unwrap_or(DEFAULT_HISTORY_RETENTION);
+
     conn.execute(
-        "DELETE FROM clipboard_items
-         WHERE id NOT IN (
+        "UPDATE clipboard_items
+         SET is_deleted = 1
+         WHERE is_favorite = 0
+           AND is_deleted = 0
+           AND id NOT IN (
             SELECT id FROM clipboard_items
-            ORDER BY updated_at DESC
+            WHERE is_deleted = 0 AND is_favorite = 0
+            ORDER BY last_copied_at DESC
             LIMIT ?1
          )",
-        params![HISTORY_LIMIT],
+        params![retention],
     )
     .map_err(|error| error.to_string())?;
 
     Ok(item_id)
+}
+
+fn items_query(tab: Option<&str>) -> &'static str {
+    match tab.unwrap_or("recent") {
+        "favorites" => {
+            "SELECT id, text, created_at, updated_at, is_favorite, favorite_at, is_deleted,
+                    copy_count, paste_count, last_copied_at, last_pasted_at, content_type
+             FROM clipboard_items
+             WHERE is_deleted = 0 AND is_favorite = 1
+             ORDER BY favorite_at DESC, last_copied_at DESC
+             LIMIT ?1"
+        }
+        "frequent" => {
+            "SELECT id, text, created_at, updated_at, is_favorite, favorite_at, is_deleted,
+                    copy_count, paste_count, last_copied_at, last_pasted_at, content_type
+             FROM clipboard_items
+             WHERE is_deleted = 0 AND paste_count > 0
+             ORDER BY paste_count DESC, last_pasted_at DESC
+             LIMIT ?1"
+        }
+        _ => {
+            "SELECT id, text, created_at, updated_at, is_favorite, favorite_at, is_deleted,
+                    copy_count, paste_count, last_copied_at, last_pasted_at, content_type
+             FROM clipboard_items
+             WHERE is_deleted = 0
+             ORDER BY last_copied_at DESC
+             LIMIT ?1"
+        }
+    }
+}
+
+fn search_query(tab: Option<&str>) -> &'static str {
+    match tab.unwrap_or("recent") {
+        "favorites" => {
+            "SELECT id, text, created_at, updated_at, is_favorite, favorite_at, is_deleted,
+                    copy_count, paste_count, last_copied_at, last_pasted_at, content_type
+             FROM clipboard_items
+             WHERE is_deleted = 0 AND is_favorite = 1 AND text LIKE ?1
+             ORDER BY favorite_at DESC, last_copied_at DESC
+             LIMIT ?2"
+        }
+        "frequent" => {
+            "SELECT id, text, created_at, updated_at, is_favorite, favorite_at, is_deleted,
+                    copy_count, paste_count, last_copied_at, last_pasted_at, content_type
+             FROM clipboard_items
+             WHERE is_deleted = 0 AND paste_count > 0 AND text LIKE ?1
+             ORDER BY paste_count DESC, last_pasted_at DESC
+             LIMIT ?2"
+        }
+        _ => {
+            "SELECT id, text, created_at, updated_at, is_favorite, favorite_at, is_deleted,
+                    copy_count, paste_count, last_copied_at, last_pasted_at, content_type
+             FROM clipboard_items
+             WHERE is_deleted = 0 AND text LIKE ?1
+             ORDER BY last_copied_at DESC
+             LIMIT ?2"
+        }
+    }
 }
 
 fn query_items<P>(conn: &Connection, sql: &str, params: P) -> Result<Vec<ClipboardItem>, String>
@@ -617,8 +898,13 @@ where
                 created_at: row.get(2)?,
                 updated_at: row.get(3)?,
                 is_favorite: row.get::<_, i64>(4)? == 1,
-                usage_count: row.get(5)?,
-                content_type: row.get(6)?,
+                favorite_at: row.get(5)?,
+                is_deleted: row.get::<_, i64>(6)? == 1,
+                copy_count: row.get(7)?,
+                paste_count: row.get(8)?,
+                last_copied_at: row.get(9)?,
+                last_pasted_at: row.get(10)?,
+                content_type: row.get(11)?,
             })
         })
         .map_err(|error| error.to_string())?;
@@ -656,6 +942,83 @@ fn add_column_if_missing(
     Ok(())
 }
 
+fn ensure_nullable_clipboard_timestamps(conn: &Connection) -> rusqlite::Result<()> {
+    let favorite_not_null = column_is_not_null(conn, "clipboard_items", "favorite_at")?;
+    let pasted_not_null = column_is_not_null(conn, "clipboard_items", "last_pasted_at")?;
+    if !favorite_not_null && !pasted_not_null {
+        return Ok(());
+    }
+
+    conn.execute_batch(
+        "
+        DROP TABLE IF EXISTS clipboard_items_migrated;
+        CREATE TABLE clipboard_items_migrated (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            text TEXT NOT NULL UNIQUE,
+            created_at INTEGER NOT NULL,
+            updated_at INTEGER NOT NULL,
+            is_favorite INTEGER NOT NULL DEFAULT 0,
+            usage_count INTEGER NOT NULL DEFAULT 0,
+            favorite_at INTEGER DEFAULT NULL,
+            is_deleted INTEGER NOT NULL DEFAULT 0,
+            copy_count INTEGER NOT NULL DEFAULT 0,
+            paste_count INTEGER NOT NULL DEFAULT 0,
+            last_copied_at INTEGER NOT NULL DEFAULT 0,
+            last_pasted_at INTEGER DEFAULT NULL,
+            content_type TEXT NOT NULL DEFAULT 'plain'
+        );
+        INSERT INTO clipboard_items_migrated (
+            id,
+            text,
+            created_at,
+            updated_at,
+            is_favorite,
+            usage_count,
+            favorite_at,
+            is_deleted,
+            copy_count,
+            paste_count,
+            last_copied_at,
+            last_pasted_at,
+            content_type
+        )
+        SELECT
+            id,
+            text,
+            created_at,
+            updated_at,
+            is_favorite,
+            usage_count,
+            NULLIF(favorite_at, 0),
+            is_deleted,
+            copy_count,
+            paste_count,
+            last_copied_at,
+            NULLIF(last_pasted_at, 0),
+            content_type
+        FROM clipboard_items;
+        DROP TABLE clipboard_items;
+        ALTER TABLE clipboard_items_migrated RENAME TO clipboard_items;
+        ",
+    )
+}
+
+fn column_is_not_null(conn: &Connection, table: &str, column: &str) -> rusqlite::Result<bool> {
+    let mut statement = conn.prepare(&format!("PRAGMA table_info({table})"))?;
+    let rows = statement.query_map([], |row| {
+        Ok((row.get::<_, String>(1)?, row.get::<_, i64>(3)?))
+    })?;
+
+    for row in rows {
+        let (name, not_null) = row?;
+        if name == column {
+            return Ok(not_null != 0);
+        }
+    }
+
+    Ok(false)
+}
+
 fn load_shortcut(db: &Db) -> Result<Shortcut, String> {
     let conn = db.lock().map_err(|_| "Database lock failed".to_string())?;
     let value =
@@ -687,6 +1050,7 @@ fn set_setting(conn: &Connection, key: &str, value: &str) -> Result<(), String> 
 
 fn default_launcher_settings() -> LauncherSettings {
     LauncherSettings {
+        language: "system".to_string(),
         theme: "system".to_string(),
         popup_position: "mouse".to_string(),
         paste_strategy: "auto".to_string(),
@@ -694,12 +1058,14 @@ fn default_launcher_settings() -> LauncherSettings {
         width: DEFAULT_WIDTH,
         height: DEFAULT_HEIGHT,
         transparency: DEFAULT_TRANSPARENCY,
+        history_retention: DEFAULT_HISTORY_RETENTION,
     }
 }
 
 fn load_launcher_settings(conn: &Connection) -> Result<LauncherSettings, String> {
     let defaults = default_launcher_settings();
     Ok(sanitize_launcher_settings(LauncherSettings {
+        language: get_setting(conn, "language")?.unwrap_or(defaults.language),
         theme: get_setting(conn, "theme")?.unwrap_or(defaults.theme),
         popup_position: get_setting(conn, "popup_position")?.unwrap_or(defaults.popup_position),
         paste_strategy: get_setting(conn, "paste_strategy")?.unwrap_or(defaults.paste_strategy),
@@ -715,10 +1081,14 @@ fn load_launcher_settings(conn: &Connection) -> Result<LauncherSettings, String>
         transparency: get_setting(conn, "transparency")?
             .and_then(|value| value.parse::<u8>().ok())
             .unwrap_or(defaults.transparency),
+        history_retention: get_setting(conn, "history_retention")?
+            .and_then(|value| value.parse::<i64>().ok())
+            .unwrap_or(defaults.history_retention),
     }))
 }
 
 fn save_launcher_settings(conn: &Connection, settings: &LauncherSettings) -> Result<(), String> {
+    set_setting(conn, "language", &settings.language)?;
     set_setting(conn, "theme", &settings.theme)?;
     set_setting(conn, "popup_position", &settings.popup_position)?;
     set_setting(conn, "paste_strategy", &settings.paste_strategy)?;
@@ -726,11 +1096,16 @@ fn save_launcher_settings(conn: &Connection, settings: &LauncherSettings) -> Res
     set_setting(conn, "window_width", &settings.width.to_string())?;
     set_setting(conn, "window_height", &settings.height.to_string())?;
     set_setting(conn, "transparency", &settings.transparency.to_string())?;
+    set_setting(conn, "history_retention", &settings.history_retention.to_string())?;
     Ok(())
 }
 
 fn sanitize_launcher_settings(settings: LauncherSettings) -> LauncherSettings {
     LauncherSettings {
+        language: match settings.language.as_str() {
+            "system" | "zh-CN" | "en-US" => settings.language,
+            _ => "system".to_string(),
+        },
         theme: match settings.theme.as_str() {
             "light" | "dark" | "system" => settings.theme,
             _ => "system".to_string(),
@@ -740,7 +1115,8 @@ fn sanitize_launcher_settings(settings: LauncherSettings) -> LauncherSettings {
             _ => "mouse".to_string(),
         },
         paste_strategy: match settings.paste_strategy.as_str() {
-            "auto" | "browser" | "native" => settings.paste_strategy,
+            "auto" | "standard" | "replace" => settings.paste_strategy,
+            "browser" | "native" => "standard".to_string(),
             _ => "auto".to_string(),
         },
         paste_delay_ms: match settings.paste_delay_ms {
@@ -749,7 +1125,14 @@ fn sanitize_launcher_settings(settings: LauncherSettings) -> LauncherSettings {
         },
         width: settings.width.clamp(MIN_WIDTH, MAX_WIDTH),
         height: settings.height.clamp(MIN_HEIGHT, MAX_HEIGHT),
-        transparency: settings.transparency.clamp(70, 100),
+        transparency: match settings.transparency {
+            70 | 80 | 88 | 90 | 100 => settings.transparency,
+            _ => DEFAULT_TRANSPARENCY,
+        },
+        history_retention: match settings.history_retention {
+            100 | 500 | 1000 | 5000 | 10000 => settings.history_retention,
+            _ => DEFAULT_HISTORY_RETENTION,
+        },
     }
 }
 
@@ -799,9 +1182,17 @@ fn normalize_shortcut(value: &str) -> Result<String, String> {
             format!("Key{}", &upper[3..])
         } else {
             match upper.as_str() {
+                "`" | "~" | "BACKQUOTE" => "Backquote".to_string(),
                 "SPACE" => "Space".to_string(),
+                "TAB" => "Tab".to_string(),
                 "ENTER" => "Enter".to_string(),
                 "ESC" | "ESCAPE" => "Escape".to_string(),
+                "ARROWUP" | "UP" => "ArrowUp".to_string(),
+                "ARROWDOWN" | "DOWN" => "ArrowDown".to_string(),
+                "ARROWLEFT" | "LEFT" => "ArrowLeft".to_string(),
+                "ARROWRIGHT" | "RIGHT" => "ArrowRight".to_string(),
+                "BACKSPACE" => "Backspace".to_string(),
+                "DELETE" | "DEL" => "Delete".to_string(),
                 _ => return Err(format!("Unsupported shortcut key: {part}")),
             }
         };
@@ -825,6 +1216,7 @@ fn display_shortcut(shortcut: &str) -> String {
             "shift" => "Shift".to_string(),
             "super" => "Win".to_string(),
             key if key.starts_with("Key") => key.trim_start_matches("Key").to_string(),
+            "Backquote" => "`".to_string(),
             key => key.to_string(),
         })
         .collect::<Vec<_>>()
@@ -859,40 +1251,71 @@ fn detect_content_type(text: &str) -> String {
     .to_string()
 }
 
-fn toggle_main_window(app: &AppHandle) {
-    if let Some(window) = app.get_webview_window("main") {
-        if window.is_visible().unwrap_or(false) {
-            let _ = window.hide();
-        } else {
-            let snapshot = capture_interaction(app);
-            let state = app.state::<AppState>();
-            if let Ok(mut previous) = state.previous_interaction.lock() {
-                *previous = snapshot.clone();
-            }
-            let settings = load_launcher_settings_from_state(&state);
-            let _ = apply_launcher_window_size(app, &settings);
-            position_main_window(app, &settings, &snapshot);
-            let _ = window.show();
-            let _ = window.set_focus();
-            let _ = app.emit("window-shown", ());
-        }
+fn toggle_launcher(app: &AppHandle, reason: &str) {
+    let real_visible = app
+        .get_webview_window("main")
+        .and_then(|window| window.is_visible().ok())
+        .unwrap_or(false);
+    let state = app.state::<AppState>();
+    let tracked_visible = state.launcher_visible.lock().map(|visible| *visible).unwrap_or(false);
+    eprintln!(
+        "[launcher] toggle reason={reason} current visible state tracked={tracked_visible} real={real_visible}"
+    );
+
+    if real_visible {
+        let _ = hide_launcher(app, reason);
+    } else {
+        let _ = show_launcher(app);
     }
 }
 
 fn show_main_window(app: &AppHandle) {
-    if let Some(window) = app.get_webview_window("main") {
-        let state = app.state::<AppState>();
-        let snapshot = capture_interaction(app);
-        if let Ok(mut previous) = state.previous_interaction.lock() {
-            *previous = snapshot.clone();
-        }
-        let settings = load_launcher_settings_from_state(&state);
-        let _ = apply_launcher_window_size(app, &settings);
-        position_main_window(app, &settings, &snapshot);
-        let _ = window.show();
-        let _ = window.set_focus();
-        let _ = app.emit("window-shown", ());
+    let _ = show_launcher(app);
+}
+
+fn show_launcher(app: &AppHandle) -> Result<(), String> {
+    eprintln!("[launcher] show_launcher called");
+    let Some(window) = app.get_webview_window("main") else {
+        return Err("Main window not found".to_string());
+    };
+
+    let snapshot = capture_interaction(app);
+    let state = app.state::<AppState>();
+    if let Ok(mut previous) = state.previous_interaction.lock() {
+        *previous = snapshot.clone();
     }
+    let settings = load_launcher_settings_from_state(&state);
+    apply_launcher_window_size(app, &settings)?;
+    position_main_window(app, &settings, &snapshot);
+    window.show().map_err(|error| error.to_string())?;
+    window.set_focus().map_err(|error| error.to_string())?;
+    if let Ok(mut visible) = state.launcher_visible.lock() {
+        *visible = true;
+        eprintln!("[launcher] updated visible state=true");
+    }
+    app.emit("window-shown", ()).map_err(|error| error.to_string())?;
+    Ok(())
+}
+
+fn hide_launcher(app: &AppHandle, reason: &str) -> Result<(), String> {
+    eprintln!("[launcher] hide_launcher called reason={reason}");
+    if let Some(window) = app.get_webview_window("main") {
+        let real_visible = window.is_visible().unwrap_or(false);
+        eprintln!("[launcher] hide current real visible={real_visible}");
+        if real_visible {
+            window.hide().map_err(|error| error.to_string())?;
+        }
+    } else {
+        eprintln!("[launcher] hide skipped: main window not found");
+    }
+
+    let state = app.state::<AppState>();
+    if let Ok(mut visible) = state.launcher_visible.lock() {
+        *visible = false;
+        eprintln!("[launcher] updated visible state=false");
+    }
+
+    Ok(())
 }
 
 fn load_launcher_settings_from_state(state: &State<'_, AppState>) -> LauncherSettings {
@@ -913,11 +1336,11 @@ fn position_main_window(
         return;
     };
 
-    let Some(monitor) = window.primary_monitor().ok().flatten() else {
+    let anchor = snapshot.caret.or(snapshot.mouse);
+    let Some(monitor) = monitor_for_anchor(&window, anchor) else {
         eprintln!("[window] no monitor available for popup positioning");
         return;
     };
-
     let area = monitor.work_area();
     let left = area.position.x;
     let top = area.position.y;
@@ -926,7 +1349,6 @@ fn position_main_window(
     let width = settings.width as i32;
     let height = settings.height as i32;
 
-    let anchor = snapshot.caret.or(snapshot.mouse);
     let (raw_x, raw_y) = if settings.popup_position == "center" {
         (left + (area.size.width as i32 - width) / 2, top + (area.size.height as i32 - height) / 2)
     } else if let Some((anchor_x, anchor_y)) = anchor {
@@ -944,6 +1366,27 @@ fn position_main_window(
         ),
         Err(error) => eprintln!("[window] failed to position popup: {error}"),
     }
+}
+
+fn monitor_for_anchor(
+    window: &tauri::WebviewWindow,
+    anchor: Option<(i32, i32)>,
+) -> Option<tauri::Monitor> {
+    let monitors = window.available_monitors().ok()?;
+    if let Some((x, y)) = anchor {
+        if let Some(monitor) = monitors.iter().find(|monitor| {
+            let area = monitor.work_area();
+            let left = area.position.x;
+            let top = area.position.y;
+            let right = left + area.size.width as i32;
+            let bottom = top + area.size.height as i32;
+            x >= left && x < right && y >= top && y < bottom
+        }) {
+            return Some(monitor.clone());
+        }
+    }
+
+    window.current_monitor().ok().flatten().or_else(|| window.primary_monitor().ok().flatten())
 }
 
 #[cfg(target_os = "windows")]
@@ -1074,23 +1517,30 @@ fn previous_process_name(hwnd: windows::Win32::Foundation::HWND) -> Option<Strin
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum PasteStrategy {
     Browser,
-    Native,
+    Standard,
+    NativeReplace,
 }
 
 #[cfg(target_os = "windows")]
 fn select_paste_strategy(requested: &str, process_name: Option<&str>) -> PasteStrategy {
     let process = process_name.unwrap_or_default().to_ascii_lowercase();
     let is_browser = matches!(process.as_str(), "chrome.exe" | "msedge.exe" | "firefox.exe");
+    let is_native_chat = matches!(
+        process.as_str(),
+        "wechat.exe" | "weixin.exe" | "qq.exe" | "feishu.exe" | "lark.exe" | "dingtalk.exe"
+    );
     match requested {
-        "browser" => return PasteStrategy::Browser,
-        "native" => return PasteStrategy::Native,
+        "standard" => return PasteStrategy::Standard,
+        "replace" => return PasteStrategy::NativeReplace,
         _ => {}
     }
 
     if is_browser {
         PasteStrategy::Browser
+    } else if is_native_chat {
+        PasteStrategy::NativeReplace
     } else {
-        PasteStrategy::Native
+        PasteStrategy::Standard
     }
 }
 
@@ -1104,7 +1554,9 @@ fn paste_into_previous_window(
         Foundation::HWND,
         System::Threading::{AttachThreadInput, GetCurrentThreadId},
         UI::{
-            Input::KeyboardAndMouse::{SendInput, INPUT, VK_CONTROL, VK_MENU, VK_TAB, VK_V},
+            Input::KeyboardAndMouse::{
+                GetFocus, SendInput, SetFocus, INPUT, VK_CONTROL, VK_DELETE, VK_MENU, VK_TAB, VK_V,
+            },
             WindowsAndMessaging::{
                 GetForegroundWindow, GetLastActivePopup, GetWindowPlacement,
                 GetWindowThreadProcessId, IsWindow, IsZoomed, SetForegroundWindow,
@@ -1119,8 +1571,9 @@ fn paste_into_previous_window(
     let original_hwnd = HWND(hwnd as *mut core::ffi::c_void);
     let strategy = select_paste_strategy(&requested_strategy, snapshot.process_name.as_deref());
     let strategy_log = match strategy {
-        PasteStrategy::Browser => "BrowserStrategy",
-        PasteStrategy::Native => "NativeSimpleStrategy",
+        PasteStrategy::Browser => "StandardPaste",
+        PasteStrategy::Standard => "StandardPaste",
+        PasteStrategy::NativeReplace => "NativeReplaceExperimental",
     };
     eprintln!("[paste_item] previous process name: {:?}", snapshot.process_name);
     eprintln!(
@@ -1128,8 +1581,12 @@ fn paste_into_previous_window(
     );
     eprintln!("[paste_item] previous HWND=0x{hwnd:x}");
 
-    eprintln!("[paste_item] wait {delay_ms}ms after hiding ClipLite");
-    thread::sleep(Duration::from_millis(delay_ms));
+    if strategy == PasteStrategy::NativeReplace {
+        eprintln!("[paste_item] NativeReplace restores immediately after hiding ClipLite");
+    } else {
+        eprintln!("[paste_item] wait {delay_ms}ms after hiding ClipLite");
+        thread::sleep(Duration::from_millis(delay_ms));
+    }
 
     let mut target_hwnd = original_hwnd;
     let mut target_valid = unsafe { IsWindow(Some(target_hwnd)).as_bool() };
@@ -1214,6 +1671,54 @@ fn paste_into_previous_window(
 
         result
     } else if target_valid {
+        let focused_control_hwnd = snapshot
+            .focused_control_hwnd
+            .map(|hwnd| HWND(hwnd as *mut core::ffi::c_void));
+        let focused_control_valid = focused_control_hwnd
+            .map(|hwnd| unsafe { IsWindow(Some(hwnd)).as_bool() })
+            .unwrap_or(false);
+        let foreground_before_paste = unsafe { GetForegroundWindow() };
+        eprintln!("[paste_item] Native restore previous_hwnd={:?}", target_hwnd.0);
+        eprintln!(
+            "[paste_item] Native restore focused_control_hwnd={:?}",
+            focused_control_hwnd.map(|hwnd| hwnd.0)
+        );
+        eprintln!("[paste_item] Native restore IsWindow(focused_control_hwnd)={focused_control_valid}");
+        eprintln!(
+            "[paste_item] Native restore GetForegroundWindow before paste={:?}",
+            foreground_before_paste.0
+        );
+
+        let current_thread = unsafe { GetCurrentThreadId() };
+        let target_thread = unsafe { GetWindowThreadProcessId(target_hwnd, None) };
+        let foreground_thread = if foreground_before_paste.0.is_null() {
+            0
+        } else {
+            unsafe { GetWindowThreadProcessId(foreground_before_paste, None) }
+        };
+        let focused_control_thread = focused_control_hwnd
+            .filter(|_| focused_control_valid)
+            .map(|hwnd| unsafe { GetWindowThreadProcessId(hwnd, None) })
+            .unwrap_or(0);
+        eprintln!(
+            "[paste_item] Native restore threads current={current_thread} previous={target_thread} foreground={foreground_thread} focused_control={focused_control_thread}"
+        );
+
+        let attach_current_target = target_thread != 0
+            && current_thread != target_thread
+            && unsafe { AttachThreadInput(current_thread, target_thread, true).as_bool() };
+        let attach_foreground_target = target_thread != 0
+            && foreground_thread != 0
+            && foreground_thread != target_thread
+            && unsafe { AttachThreadInput(foreground_thread, target_thread, true).as_bool() };
+        let attach_current_control = focused_control_thread != 0
+            && focused_control_thread != target_thread
+            && focused_control_thread != current_thread
+            && unsafe { AttachThreadInput(current_thread, focused_control_thread, true).as_bool() };
+        eprintln!(
+            "[paste_item] Native restore AttachThreadInput current_target={attach_current_target} foreground_target={attach_foreground_target} current_control={attach_current_control}"
+        );
+
         let result = unsafe {
             let foreground_result = SetForegroundWindow(target_hwnd).as_bool();
             let foreground_after = GetForegroundWindow();
@@ -1221,8 +1726,40 @@ fn paste_into_previous_window(
                 "[paste_item] native/simple SetForegroundWindow={foreground_result} foreground={:?}",
                 foreground_after.0
             );
+            if let Some(control_hwnd) = focused_control_hwnd.filter(|_| focused_control_valid) {
+                let previous_focus = SetFocus(Some(control_hwnd));
+                eprintln!(
+                    "[paste_item] Native restore SetFocus focused_control_hwnd={:?} previous_focus={:?}",
+                    control_hwnd.0,
+                    previous_focus.as_ref().map(|hwnd| hwnd.0)
+                );
+                if let Err(error) = previous_focus {
+                    eprintln!("[paste_item] Native restore SetFocus failed: {error}");
+                }
+            } else {
+                eprintln!("[paste_item] Native restore skipped SetFocus: no valid focused_control_hwnd");
+            }
+            let focus_after = GetFocus();
+            eprintln!(
+                "[paste_item] Native restore GetFocus result after restore={:?}",
+                focus_after.0
+            );
             foreground_result && foreground_after == target_hwnd
         };
+
+        if attach_current_control {
+            let detached = unsafe { AttachThreadInput(current_thread, focused_control_thread, false).as_bool() };
+            eprintln!("[paste_item] Native restore detach current/control thread={detached}");
+        }
+        if attach_foreground_target {
+            let detached = unsafe { AttachThreadInput(foreground_thread, target_thread, false).as_bool() };
+            eprintln!("[paste_item] Native restore detach foreground/target thread={detached}");
+        }
+        if attach_current_target {
+            let detached = unsafe { AttachThreadInput(current_thread, target_thread, false).as_bool() };
+            eprintln!("[paste_item] Native restore detach current/target thread={detached}");
+        }
+
         result
     } else {
         false
@@ -1265,8 +1802,23 @@ fn paste_into_previous_window(
         eprintln!("[paste_item] foreground after restore attempts={:?}", foreground.0);
     }
 
-    eprintln!("[paste_item] wait {delay_ms}ms before Ctrl+V");
-    thread::sleep(Duration::from_millis(delay_ms));
+    if strategy == PasteStrategy::NativeReplace {
+        eprintln!("[paste_item] NativeReplace wait 200ms before Delete");
+        thread::sleep(Duration::from_millis(200));
+        let delete_input = [keyboard_input(VK_DELETE.0, false), keyboard_input(VK_DELETE.0, true)];
+        let delete_start = Instant::now();
+        let delete_sent = unsafe { SendInput(&delete_input, std::mem::size_of::<INPUT>() as i32) };
+        eprintln!("[paste_item] NativeReplace delete send time {:?}", delete_start.elapsed());
+        eprintln!(
+            "[paste_item] NativeReplace Delete SendInput sent={delete_sent}/{}",
+            delete_input.len()
+        );
+        eprintln!("[paste_item] NativeReplace wait 50ms before Ctrl+V");
+        thread::sleep(Duration::from_millis(50));
+    } else {
+        eprintln!("[paste_item] wait {delay_ms}ms before Ctrl+V");
+        thread::sleep(Duration::from_millis(delay_ms));
+    }
 
     let inputs = [
         keyboard_input(VK_CONTROL.0, false),

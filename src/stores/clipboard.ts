@@ -3,7 +3,7 @@ import { invoke } from '@tauri-apps/api/core';
 import { listen } from '@tauri-apps/api/event';
 import type { ClipboardItem, LauncherSettings } from '../types';
 
-export type HistoryTab = 'all' | 'favorites';
+export type HistoryTab = 'recent' | 'favorites' | 'frequent';
 
 type HistoryUpdatedPayload = {
   item_id?: number;
@@ -13,7 +13,7 @@ export const useClipboardStore = defineStore('clipboard', {
   state: () => ({
     items: [] as ClipboardItem[],
     searchQuery: '',
-    activeTab: 'all' as HistoryTab,
+    activeTab: 'recent' as HistoryTab,
     loading: false,
     initialized: false,
     selectedId: null as number | null,
@@ -22,24 +22,22 @@ export const useClipboardStore = defineStore('clipboard', {
     globalShortcut: 'Ctrl+Alt+V',
     shortcutLoading: false,
     launcherSettings: {
+      language: 'system',
       theme: 'system',
       popupPosition: 'mouse',
       pasteStrategy: 'auto',
       pasteDelayMs: 200,
       width: 620,
       height: 460,
-      transparency: 88
+      transparency: 88,
+      historyRetention: 1000
     } as LauncherSettings,
     settingsLoading: false,
     error: ''
   }),
   getters: {
     filteredItems(state) {
-      if (state.activeTab === 'all') {
-        return state.items;
-      }
-
-      return state.items.filter((item) => item.is_favorite);
+      return state.items;
     },
     selectedItem(state) {
       return state.items.find((item) => item.id === state.selectedId) ?? null;
@@ -68,8 +66,8 @@ export const useClipboardStore = defineStore('clipboard', {
       try {
         const query = this.searchQuery.trim();
         this.items = query
-          ? await invoke<ClipboardItem[]>('search_items', { query })
-          : await invoke<ClipboardItem[]>('list_items');
+          ? await invoke<ClipboardItem[]>('search_items', { query, tab: this.activeTab })
+          : await invoke<ClipboardItem[]>('list_items', { tab: this.activeTab });
 
         if (this.filteredItems.length > 0 && !this.selectedId) {
           this.selectedId = this.filteredItems[0].id;
@@ -84,9 +82,11 @@ export const useClipboardStore = defineStore('clipboard', {
         this.loading = false;
       }
     },
-    setTab(tab: HistoryTab) {
+    async setTab(tab: HistoryTab) {
       this.activeTab = tab;
-      this.selectedId = this.filteredItems[0]?.id ?? null;
+      this.selectedId = null;
+      this.items = [];
+      await this.refresh();
     },
     async setSearch(query: string) {
       this.searchQuery = query;
@@ -137,8 +137,8 @@ export const useClipboardStore = defineStore('clipboard', {
         this.error = String(error);
       }
     },
-    async hideWindow() {
-      await invoke('hide_window');
+    async hideWindow(reason = 'command') {
+      await invoke('hide_window', { reason });
     },
     async refreshAutoStart() {
       this.autoStartLoading = true;

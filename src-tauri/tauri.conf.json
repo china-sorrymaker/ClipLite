@@ -12,6 +12,7 @@
   "app": {
     "windows": [
       {
+        "label": "main",
         "title": "ClipLite",
         "width": 620,
         "height": 460,
@@ -22,6 +23,21 @@
         "transparent": true,
         "shadow": true,
         "skipTaskbar": true,
+        "fullscreen": false,
+        "visible": false
+      },
+      {
+        "label": "settings",
+        "title": "ClipLite Settings",
+        "width": 720,
+        "height": 560,
+        "resizable": false,
+        "decorations": true,
+        "transparent": false,
+        "shadow": true,
+        "skipTaskbar": false,
+        "alwaysOnTop": true,
+        "center": true,
         "fullscreen": false,
         "visible": false
       }
