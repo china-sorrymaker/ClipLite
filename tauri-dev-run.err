@@ -1,0 +1,7 @@
+     Running BeforeDevCommand (`npm run dev`)
+     Running DevCommand (`cargo  run --no-default-features --color always --`)
+        Info Watching D:\software\natapp\workSpace\ClipLite\src-tauri for changes...
+[1m[92m    Finished[0m ]8;;https://doc.rust-lang.org/cargo/reference/profiles.html#default-profiles\`dev` profile [unoptimized + debuginfo]]8;;\ target(s) in 0.38s
+[1m[92m     Running[0m `target\debug\cliplite.exe`
+[window] applied launcher size 620x460
+[0603/145948.550:ERROR:ui\gfx\win\window_impl.cc:172] Failed to unregister class Chrome_WidgetWin_0. Error = 1412
